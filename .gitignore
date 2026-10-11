@@ -1,0 +1,29 @@
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build
+/app/build
+/captures
+.externalNativeBuild
+.cxx
+
+# 交叉编译产物（体积巨大，不入库）
+/scripts/work/
+/scripts/dist
+
+# 模型资产（按需自行放置）
+/app/src/main/assets/models/*
+!/app/src/main/assets/models/README.txt
+
+# 由 scripts/prepare_jni_libs.sh 自动汇总的 native 库
+/app/src/main/jniLibs/
+/app/local.properties
+
+
+# NDK/CMake 构建中间产物
+/app/.cxx/
+
+# Kotlin 编译器错误日志
+.kotlin/

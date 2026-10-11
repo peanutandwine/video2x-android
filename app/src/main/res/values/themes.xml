@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Compose 应用只需一个无 ActionBar 的宿主主题。
+      这里不引入 com.google.android.material 依赖，直接继承平台 Material 主题。
+    -->
+    <style name="Theme.Video2X" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/white</item>
+    </style>
+</resources>

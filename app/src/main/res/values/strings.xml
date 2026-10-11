@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Video2X</string>
+    <string name="channel_name">视频处理</string>
+    <string name="channel_desc">Video2X 视频超分 / 插帧任务</string>
+</resources>
