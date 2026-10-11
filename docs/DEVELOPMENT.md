@@ -197,6 +197,8 @@ APK 内已确认包含：`libvideo2x.so`、`libvideo2x_jni.so`、`libav*.so`、`
 | 14 | 设备弹「Android 应用兼容性：以下库未进行 16 KB 对齐」 | NDK r27 默认 **4KB 页对齐**，自建库的 LOAD 段是 `0x1000`；Android 15+ 要求 `0x4000` | 所有链接步骤加 `-Wl,-z,max-page-size=16384`（libvideo2x、三个算法库、JNI 层）。NDK r27.2 自带的 libc++/libomp 已对齐，无需换 NDK |
 | 15 | Real-ESRGAN 报 `model param file not found: ...-x2.param` | 界面里的模型名/倍率是凭印象写的，与上游 `models/` 实际文件不符：只有 `realesr-animevideov3` 有 x2/x3/x4，其余模型**仅 x4**；RealCUGAN 的路径是 `<变体>/up<N>x-<降噪>.param` 三维组合 | 按实际打包的模型文件重建可选清单，模型与倍率联动、RealCUGAN 拆成 变体/倍率/降噪 三个参数 |
 | 16 | MediaCodec 编码器报 `Failed to initialize encoder: Bitstream filter not found` | **FFmpeg 上游 bug**：`libavcodec/mediacodecenc.c` 的 `mediacodec_init_bsf()` 中 `char str[128];` 未初始化。当 `crop==0`（输出尺寸已按 16 对齐）而 `extract_extradata==true`（mp4 输出使 video2x 置上 `AV_CODEC_FLAG_GLOBAL_HEADER`）时，代码跳过 `snprintf` 直接对未初始化缓冲区做 `av_strlcatf` 追加，垃圾串交给 `av_bsf_list_parse_str()` 必然失败 | 在 `apply_patches.sh` 中打补丁：`char str[128] = { 0 };`（幂等注入，不依赖行号） |
+| 17 | 开启 R8 后 release 构建报 `Gradle build daemon disappeared unexpectedly`（R8 其实已跑完，死在 `lintVitalRelease`） | 构建环境内存上限 8 GB，而构建期同时存在 Gradle daemon（默认配了 `-Xmx4096m`）、Kotlin 编译 daemon、R8、lint 数个进程，峰值超限后 daemon 被 OOM kill | 把 `org.gradle.jvmargs` 调小到 `-Xmx2560m`、单独限制 `kotlin.daemon.jvmargs`、关掉 `org.gradle.parallel`，并设 `lint { checkReleaseBuilds = false }`（需要时手动跑 `gradle lint`） |
+| 18 | 图片超分：多帧图片报 `Cannot write more than one file with the same name` | FFmpeg 的 `image2` muxer 在输出文件名不含 `%d` 序号时，只能写一张图；写第二帧直接失败。而 GIF 会被解码成多帧 | 图片模式只接受单帧静态格式，在 UI（`FileBridge.isImageName`）与 native（`is_image_file`）两侧用**同一份**扩展名白名单，刻意排除 `gif`。另外 GIF 这类动图本来也不适合超分 |
 
 ---
 

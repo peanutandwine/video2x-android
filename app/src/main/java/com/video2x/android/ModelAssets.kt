@@ -19,7 +19,8 @@ object ModelAssets {
     private const val ASSET_ROOT = "models"
 
     /** 资源版本号：模型集发生变化时递增，会触发重新解压 */
-    private const val VERSION = "1"
+    // 2：内置 RIFE v4 系列补帧模型（此前仅内置超分模型，RIFE 需手动导入）
+    private const val VERSION = "2"
 
     fun modelsDir(context: Context): File = File(context.filesDir, "models")
 

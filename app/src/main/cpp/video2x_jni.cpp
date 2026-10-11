@@ -18,6 +18,8 @@
 
 #include <android/log.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
@@ -30,9 +32,10 @@
 #include <spdlog/sinks/base_sink.h>
 #include <spdlog/spdlog.h>
 
-// FFmpeg 头（用于 AVHWDeviceType）
+// FFmpeg 头（AVHWDeviceType / av_get_pix_fmt_name）
 extern "C" {
 #include <libavutil/hwcontext.h>
+#include <libavutil/pixdesc.h>
 }
 
 #include "libvideo2x/libvideo2x.h"
@@ -59,6 +62,28 @@ std::string jstr(JNIEnv* env, jstring s) {
         env->ReleaseStringUTFChars(s, c);
     }
     return out;
+}
+
+// 单帧静态图片的扩展名判断。
+//
+// 上游只提供 VideoProcessor（文件级 API），没有独立的图片接口；但 FFmpeg 会把
+// 单张图片解复用成「只有 1 帧的视频流」，因此图片可以走完全相同的管线 ——
+// 只是编码侧必须换成图片编码器（见下方 process() 里的图片分支）。
+//
+// 注意排除 gif：多帧输入时 image2 muxer 在写第二帧会直接失败
+// （"Cannot write more than one file with the same name"）。
+bool is_image_file(const std::string& path) {
+    const auto dot = path.rfind('.');
+    if (dot == std::string::npos) {
+        return false;
+    }
+    std::string ext = path.substr(dot + 1);
+    std::transform(
+        ext.begin(), ext.end(), ext.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); }
+    );
+    return ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "webp" ||
+           ext == "bmp" || ext == "tif" || ext == "tiff";
 }
 
 // Kotlin 侧 Algo 枚举 → 上游 ProcessorType
@@ -285,19 +310,42 @@ Java_com_video2x_android_Video2XNative_process(
             return -1;
     }
 
+    // ---- 图片模式 ----
+    // 图片与视频走完全相同的 VideoProcessor，差别只在编码侧：
+    //   · codec 换成 png —— 输出扩展名是 .png，FFmpeg 据此选 image2 muxer
+    //   · pix_fmt 用 RGB24 —— PNG 本身在 RGB 域，走 YUV 反而白过一次色彩转换
+    //   · 单张图没有码率 / GOP / 音频字幕的概念，一律关掉
+    const bool is_image = is_image_file(in);
+
+    if (is_image && proc_cfg.processor_type == ProcessorType::RIFE) {
+        LOGE("process: RIFE 不适用于单张图片（插帧依赖帧间关系）");
+        return -1;
+    }
+
     video2x::encoder::EncoderConfig enc_cfg;
     enc_cfg.codec = codec_name.empty() ? std::string("libx264") : codec_name;
 
-    // 像素格式：
-    //  · MediaCodec 编码器在多数设备上只接受 NV12 —— FFmpeg 实测报
-    //    "some devices don't support yuv420p as encoder input format"，
-    //    随后 MediaCodec configure 失败(-10000)。
-    //  · 软编码器（libx264 / mpeg4）统一用 YUV420P。
-    // 上游的 ncnn_mat_to_avframe() 通过 swscale 转换，NV12 是支持的。
-    const bool is_mediacodec = enc_cfg.codec.find("mediacodec") != std::string::npos;
-    enc_cfg.pix_fmt = is_mediacodec ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P;
+    const bool is_mediacodec =
+        !is_image && enc_cfg.codec.find("mediacodec") != std::string::npos;
 
-    enc_cfg.bit_rate = static_cast<int64_t>(bit_rate);
+    if (is_image) {
+        enc_cfg.codec = "png";
+        enc_cfg.pix_fmt = AV_PIX_FMT_RGB24;
+        enc_cfg.bit_rate = 0;
+        enc_cfg.copy_audio_streams = false;
+        enc_cfg.copy_subtitle_streams = false;
+    } else {
+        // 像素格式：
+        //  · MediaCodec 编码器在多数设备上只接受 NV12 —— FFmpeg 实测报
+        //    "some devices don't support yuv420p as encoder input format"，
+        //    随后 MediaCodec configure 失败(-10000)。
+        //  · 软编码器（libx264 / mpeg4）统一用 YUV420P。
+        // 上游的 ncnn_mat_to_avframe() 通过 swscale 转换，NV12 是支持的。
+        enc_cfg.pix_fmt = is_mediacodec ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P;
+        enc_cfg.bit_rate = static_cast<int64_t>(bit_rate);
+        enc_cfg.copy_audio_streams = true;
+        enc_cfg.copy_subtitle_streams = true;
+    }
 
     if (is_mediacodec) {
         // MediaCodec 若不指定 gop_size，会退化为 i-frame-interval=1（每帧都是 I 帧），
@@ -312,14 +360,13 @@ Java_com_video2x_android_Video2XNative_process(
         }
     }
 
-    enc_cfg.copy_audio_streams = true;
-    enc_cfg.copy_subtitle_streams = true;
-
     // 打印编码器**实际收到**的参数（用于核对参数是否真的传到位）
+    const char* pix_fmt_name = av_get_pix_fmt_name(enc_cfg.pix_fmt);
     video2x::logger()->info(
-        "encoder cfg: codec={} pix_fmt={} gop_size={} bit_rate={} threads={}",
+        "encoder cfg: mode={} codec={} pix_fmt={} gop_size={} bit_rate={} threads={}",
+        is_image ? "image" : "video",
         enc_cfg.codec,
-        is_mediacodec ? "nv12" : "yuv420p",
+        pix_fmt_name != nullptr ? pix_fmt_name : "none",
         enc_cfg.gop_size,
         enc_cfg.bit_rate,
         enc_cfg.thread_count

@@ -7,6 +7,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.BitmapFactory
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
@@ -46,6 +47,12 @@ data class ProcessRequest(
     val shader: String,
     val codec: String,
     val bitRate: Long,
+    /**
+     * 输入是否为单帧静态图片。
+     * 图片与视频走同一条 native 管线（FFmpeg 把图片解复用为只有 1 帧的视频流），
+     * 但对目标尺寸的探测方式、以及是否需要码率/硬件编码预检都不同。
+     */
+    val isImage: Boolean = false,
 )
 
 /** 供 UI 观察的运行状态 */
@@ -117,21 +124,40 @@ class ProcessingService : Service() {
         }
 
         try {
-            publish(ProcessStatus(running = true, message = "导入输入视频…"))
+            publish(
+                ProcessStatus(
+                    running = true,
+                    message = if (req.isImage) "导入输入图片…" else "导入输入视频…",
+                )
+            )
             val inFile = FileBridge.importInput(ctx, Uri.parse(req.inUri))
 
-            // --- 分辨率预检 -------------------------------------------------
-            // 硬件编码器（MediaCodec）对分辨率存在硬上限（常见 4096），
-            // 超出后 configure 会直接失败并返回 -10000（external error）。
-            // 这里提前探测并拦截，避免用户白等。
-            val info = probeVideoInfo(inFile)
-            val inW = info.width
-            val inH = info.height
+            // --- 输入尺寸探测 -------------------------------------------------
+            //  · 视频：MediaExtractor / MediaMetadataRetriever
+            //  · 图片：BitmapFactory 只读文件头（inJustDecodeBounds=true），不解码像素
+            //
+            // 分辨率预检（下方）只对硬件编码器有意义：MediaCodec 对分辨率存在硬上限
+            //（常见 4096），超出后 configure 直接失败并返回 -10000。图片走 PNG
+            // 编码器，没有这个限制，所以探到尺寸后不做拦截。
+            val videoInfo = if (req.isImage) null else probeVideoInfo(inFile)
+
+            val inW: Int
+            val inH: Int
+            if (req.isImage) {
+                val size = probeImageSize(inFile)
+                inW = size.first
+                inH = size.second
+            } else {
+                inW = videoInfo!!.width
+                inH = videoInfo!!.height
+            }
+            val srcBitRate = videoInfo?.bitRate ?: 0L
 
             // 解析目标尺寸：
             //  · 手动值优先 —— 需宽高同时 > 0 才生效
             //  · 否则按「输入分辨率 × 倍率」自动推算
-            //  · NV12 / YUV420P 要求偶数尺寸，向下对齐到偶数
+            //  · 视频编码要求偶数尺寸（NV12 / YUV420P），向下对齐到偶数；
+            //    图片走 RGB24 无此限制，但一并对齐，保持行为一致
             val scaleFactor = if (req.scale > 0) req.scale else 1
             val manualOk = req.width > 0 && req.height > 0
             val outW = if (manualOk) req.width and -2 else (inW * scaleFactor) and -2
@@ -143,12 +169,16 @@ class ProcessingService : Service() {
             val nativeH = if (req.algo.needsDimensions) outH else 0
 
             // ---- 码率解析 ----
+            // 图片输出是 PNG（无损），没有码率概念；视频则：
             //  · 用户填 > 0           → 用用户值
             //  · 填 0 + 硬件编码      → 按「输入码率 × 输出/输入像素比」推算。
             //    MediaCodec 必须拿到正码率，无法像 libx264 那样走"自动"。
             //  · 填 0 + 软编码        → 传 0，交给 libx264 的默认 CRF（质量优先）
-            val autoBitRate = autoBitRateFor(info.bitRate, inW, inH, outW, outH)
+            val autoBitRate =
+                if (req.isImage) 0L
+                else autoBitRateFor(srcBitRate, inW, inH, outW, outH)
             val effectiveBitRate = when {
+                req.isImage -> 0L
                 req.bitRate > 0 -> req.bitRate
                 req.codec.contains("mediacodec") -> autoBitRate
                 else -> 0L
@@ -156,12 +186,15 @@ class ProcessingService : Service() {
 
             appendLog(
                 req.logPath,
-                "[app] input=${inW}x$inH output=${outW}x$outH manual=$manualOk " +
-                    "codec=${req.codec} scale=$scaleFactor " +
-                    "src_bitrate=${info.bitRate} out_bitrate=$effectiveBitRate",
+                "[app] mode=${if (req.isImage) "image" else "video"} " +
+                    "input=${inW}x$inH output=${outW}x$outH manual=$manualOk " +
+                    "codec=${if (req.isImage) "png" else req.codec} scale=$scaleFactor " +
+                    "src_bitrate=$srcBitRate out_bitrate=$effectiveBitRate",
             )
 
-            if (req.codec.contains("mediacodec") && outW > HW_MAX_DIM && outH > 0) {
+            if (!req.isImage &&
+                req.codec.contains("mediacodec") && outW > HW_MAX_DIM && outH > 0
+            ) {
                 val msg = "输出 ${outW}x$outH 超出硬件编码器上限(${HW_MAX_DIM})，" +
                     "请改用 libx264 或降低倍率"
                 appendLog(req.logPath, "[app] aborted: $msg")
@@ -349,6 +382,26 @@ class ProcessingService : Service() {
      * MP4 容器一般不写该字段，此时退化为 METADATA_KEY_BITRATE ——
      * 那是 Android 按「文件大小 / 时长」估算的整体码率（含音频），用于推算足够。
      */
+    /**
+     * 读取图片尺寸。
+     *
+     * 用 BitmapFactory 只解析文件头（inJustDecodeBounds = true），不会真正解码像素，
+     * 对几千像素的大图也是毫秒级。失败返回 (0, 0)。
+     */
+    private fun probeImageSize(file: File): Pair<Int, Int> {
+        return try {
+            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, opts)
+            if (opts.outWidth > 0 && opts.outHeight > 0) {
+                opts.outWidth to opts.outHeight
+            } else {
+                0 to 0
+            }
+        } catch (_: Throwable) {
+            0 to 0
+        }
+    }
+
     private fun probeVideoInfo(file: File): VideoInfo {
         var w = 0
         var h = 0
@@ -443,6 +496,12 @@ class ProcessingService : Service() {
                 "webm" -> "video/webm"
                 "mov" -> "video/quicktime"
                 "avi" -> "video/x-msvideo"
+                // 图片超分的产物（统一 PNG，见 FileBridge.buildOutputPath）
+                "png" -> "image/png"
+                "jpg", "jpeg" -> "image/jpeg"
+                "webp" -> "image/webp"
+                "bmp" -> "image/bmp"
+                "tif", "tiff" -> "image/tiff"
                 else -> "video/*"
             }
             MediaScannerConnection.scanFile(

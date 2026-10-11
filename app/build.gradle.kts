@@ -18,8 +18,8 @@ android {
         applicationId = "com.video2x.android"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.2.1"
+        versionCode = 5
+        versionName = "0.3.0"
 
         // 只做 arm64-v8a：v7a 无实用价值，x86_64 仅模拟器需要
         ndk {
@@ -54,12 +54,22 @@ android {
     }
 
     buildTypes {
+        // R8（压缩 + 混淆）。
+        //
+        // 注意收益的边界：APK 体积的大头是模型（155MB，noCompress 不压缩）与
+        // native 库（61MB，压缩后约 33MB），R8 只能作用于 dex 那一部分
+        //（未压缩 44MB → 压缩后 12MB）。所以它只能省个位数 MB，
+        // 真正的体积决策在于「模型是否内置」。
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // 个人使用场景：release 直接复用 debug 签名 —— 免于管理密钥库，
+            // 且能与此前安装的 debug 包直接互相覆盖。
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
@@ -89,6 +99,14 @@ android {
     // 模型体积较大时关闭压缩，避免构建期无谓开销
     androidResources {
         noCompress += listOf("bin", "param", "glsl")
+    }
+
+    lint {
+        // release 构建默认会执行 lintVital（强制致命问题检查），这个任务内存开销
+        // 很大 —— 在 8GB 内存上限的环境里会把 Gradle daemon 拖死
+        //（"Gradle build daemon disappeared unexpectedly"）。
+        // 需要时手动执行 `gradle lint` 即可。
+        checkReleaseBuilds = false
     }
 }
 

@@ -120,8 +120,9 @@ fun SettingsScreen(
         // ---------------------------------------------------------- 补帧模型
         Text("补帧模型（RIFE）", style = MaterialTheme.typography.titleMedium)
         Text(
-            "RIFE 模型全部约 474MB，为避免 APK 过大未随包发布，需要在这里单独导入。" +
-                "超分模型（Real-ESRGAN / Real-CUGAN / Anime4K）已内置，无需导入。",
+            "RIFE 补帧模型（v4 系列 5 个）已随 APK 内置，开箱即用。" +
+                "此处可额外导入其他版本的 RIFE 模型（上游全部版本合计约 474MB）。" +
+                "超分模型（Real-ESRGAN / Real-CUGAN / Anime4K）同样已内置。",
             style = MaterialTheme.typography.bodySmall,
         )
 

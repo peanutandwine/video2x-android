@@ -74,6 +74,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var inputUri by mutableStateOf<Uri?>(null)
         private set
 
+    /**
+     * 当前输入是否为单帧静态图片（由 setInput 判定）。
+     * 图片走同一套处理管线，但编码输出为 PNG，且不适用插帧与硬件编码器。
+     */
+    var isImageInput by mutableStateOf(false)
+        private set
+
     var permGranted by mutableStateOf(true)
         private set
 
@@ -179,6 +186,26 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setInput(uri: Uri?) {
         inputUri = uri
+
+        // 判断是否为「单帧静态图片」。
+        // 图片与视频共用同一条 native 管线，但 UI 上要收敛可选项：
+        // 不做插帧（依赖帧间关系）、不用硬件编码器（无码率/GOP 概念）。
+        //
+        // 显示名优先（native 侧也是按扩展名判断），MIME 仅作兜底。
+        // 注意排除 gif：多帧输入会让 image2 muxer 写第二帧时失败。
+        val ctx = getApplication<Application>()
+        val name = uri?.let { FileBridge.displayName(ctx, it) }
+        val mime = uri?.let { ctx.contentResolver.getType(it) }
+        val mimeIsStaticImage = mime != null &&
+            mime.startsWith("image/") && mime != "image/gif"
+
+        isImageInput = uri != null &&
+            (FileBridge.isImageName(name) || (name == null && mimeIsStaticImage))
+
+        // 图片无法插帧 —— 若当前停在 RIFE 上，自动切回 Real-ESRGAN
+        if (isImageInput && algo == Algo.RIFE) {
+            algo = Algo.REALESRGAN
+        }
     }
 
     /** 计算默认输出路径（原文件名 + 算法参数） */
@@ -191,6 +218,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         height = outHeight.toIntOrNull() ?: 0,
         frameMultiplier = frameMultiplier,
         shader = shaderId,
+        isImage = isImageInput,
     )
 
     fun start(outPath: String) {
@@ -219,6 +247,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             shader = shaderId,
             codec = codecId,
             bitRate = bitRateText.toLongOrNull() ?: 0L,
+            isImage = isImageInput,
         )
         ProcessBus.status.value = ProcessStatus(running = true, message = "启动中…")
 
@@ -283,7 +312,10 @@ private fun MainScreen(vm: MainViewModel = viewModel()) {
         try {
             inputPicker.launch(
                 Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                    type = "video/*"
+                    // 同时允许图片与视频：EXTRA_MIME_TYPES 让 SAF 只列出这两类，
+                    // type 保持 */* 才能让多类型过滤生效。
+                    type = "*/*"
+                    putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "video/*"))
                     addCategory(Intent.CATEGORY_OPENABLE)
                 }
             )
@@ -309,7 +341,7 @@ private fun MainScreen(vm: MainViewModel = viewModel()) {
             type = "*/*"
         }
         try {
-            inputPicker.launch(Intent.createChooser(inner, "选择视频"))
+            inputPicker.launch(Intent.createChooser(inner, "选择图片或视频"))
         } catch (_: Exception) {
             pickVideoSystem()
         }
@@ -321,6 +353,7 @@ private fun MainScreen(vm: MainViewModel = viewModel()) {
     val outputPath = remember(
         vm.inputUri, vm.algo, vm.esrganModelId, vm.esrganScale, vm.cuganComboIndex,
         vm.rifeModelId, vm.frameMultiplier, vm.shaderId, vm.outWidth, vm.outHeight,
+        vm.isImageInput,
     ) {
         vm.outputPathFor(inputName)
     }
@@ -377,7 +410,10 @@ private fun MainScreen(vm: MainViewModel = viewModel()) {
 
         // ---- 输入 ----
         Column {
-            Text("输入视频", style = MaterialTheme.typography.labelLarge)
+            Text(
+                if (vm.isImageInput) "输入图片" else "输入视频",
+                style = MaterialTheme.typography.labelLarge,
+            )
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Button(onClick = { pickVideo() }) {
                     Text("选择")
@@ -391,7 +427,7 @@ private fun MainScreen(vm: MainViewModel = viewModel()) {
             }
             Text(
                 "「选择」会弹出应用列表，可选相册、第三方文件管理器（如 MT 管理器）等；" +
-                    "「系统文件」直接调用系统文档选择器。",
+                    "「系统文件」直接调用系统文档选择器。视频与图片都可以选。",
                 style = MaterialTheme.typography.bodySmall,
             )
         }
@@ -415,9 +451,14 @@ private fun MainScreen(vm: MainViewModel = viewModel()) {
         HorizontalDivider()
 
         // ---- 算法 ----
+        // 图片输入不支持插帧（RIFE 依赖帧间关系），从候选里去掉
         EnumDropdown(
             label = "算法",
-            options = Algo.entries.toList(),
+            options = if (vm.isImageInput) {
+                Algo.entries.filter { it != Algo.RIFE }
+            } else {
+                Algo.entries.toList()
+            },
             selected = vm.algo,
             optionLabel = { it.label },
             onSelect = { vm.algo = it },
@@ -508,26 +549,35 @@ private fun MainScreen(vm: MainViewModel = viewModel()) {
             }
         }
 
-        EnumDropdown(
-            label = "视频编码器",
-            options = Catalogs.codecs,
-            selected = Catalogs.codecs.firstOrNull { it.id == vm.codecId }
-                ?: Catalogs.codecs.first(),
-            optionLabel = { it.label },
-            onSelect = { vm.codecId = it.id },
-        )
+        // 图片输出为 PNG（无损），没有编码器与码率的概念 —— 整块隐藏
+        if (!vm.isImageInput) {
+            EnumDropdown(
+                label = "视频编码器",
+                options = Catalogs.codecs,
+                selected = Catalogs.codecs.firstOrNull { it.id == vm.codecId }
+                    ?: Catalogs.codecs.first(),
+                optionLabel = { it.label },
+                onSelect = { vm.codecId = it.id },
+            )
 
-        OutlinedTextField(
-            value = vm.bitRateText,
-            onValueChange = { vm.bitRateText = it.filter(Char::isDigit) },
-            label = { Text("码率（bit/s，0 = 自动）") },
-            singleLine = true,
-        )
-        Text(
-            "0 = 自动：按「输入码率 × 输出/输入像素比」推算（硬件编码需正码率）；" +
-                "软编码 libx264 填 0 时走默认 CRF。",
-            style = MaterialTheme.typography.bodySmall,
-        )
+            OutlinedTextField(
+                value = vm.bitRateText,
+                onValueChange = { vm.bitRateText = it.filter(Char::isDigit) },
+                label = { Text("码率（bit/s，0 = 自动）") },
+                singleLine = true,
+            )
+            Text(
+                "0 = 自动：按「输入码率 × 输出/输入像素比」推算（硬件编码需正码率）；" +
+                    "软编码 libx264 填 0 时走默认 CRF。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        } else {
+            Text(
+                "图片模式：输出为 PNG（无损），不需要选择编码器与码率。" +
+                    "支持 png / jpg / webp / bmp / tiff；GIF 等多帧格式不支持。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
 
         HorizontalDivider()
 

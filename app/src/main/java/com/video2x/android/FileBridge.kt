@@ -80,7 +80,18 @@ object FileBridge {
     /** 将输入 URI 拷贝到私有工作目录，返回本地文件 */
     fun importInput(context: Context, uri: Uri): File {
         val name = displayName(context, uri) ?: "input.mp4"
-        val ext = name.substringAfterLast('.', "mp4").ifBlank { "mp4" }
+        var ext = name.substringAfterLast('.', "").lowercase(Locale.US)
+
+        // 某些 provider 的显示名不带扩展名（或就是个 UUID）—— 此时用 MIME 兜底。
+        // native 侧依赖扩展名区分「图片 / 视频」并据此选择编码器，
+        // 扩展名错了会被当成视频，用 mp4 编码器去处理单帧图片而失败。
+        if (ext.isEmpty()) {
+            ext = extFromMime(context.contentResolver.getType(uri))
+        }
+        if (ext.isEmpty()) {
+            ext = "mp4"
+        }
+
         val dst = File(workDir(context), "input.$ext")
         if (dst.exists()) dst.delete()
 
@@ -91,12 +102,40 @@ object FileBridge {
         return dst
     }
 
+    /** MIME → 扩展名。只覆盖 native 侧需要区分的类型。 */
+    private fun extFromMime(mime: String?): String = when (mime) {
+        "image/png" -> "png"
+        "image/jpeg" -> "jpg"
+        "image/webp" -> "webp"
+        "image/bmp", "image/x-ms-bmp" -> "bmp"
+        "image/tiff" -> "tiff"
+        "video/mp4" -> "mp4"
+        "video/x-matroska" -> "mkv"
+        "video/webm" -> "webm"
+        "video/quicktime" -> "mov"
+        else -> ""
+    }
+
+    /**
+     * 文件名是否为单帧静态图片。
+     * 与 native 侧 video2x_jni.cpp 的 is_image_file() 保持一致的集合 ——
+     * 刻意排除 gif：多帧输入会让 image2 muxer 在写第二帧时直接失败。
+     */
+    fun isImageName(name: String?): Boolean {
+        val ext = name?.substringAfterLast('.', "")?.lowercase(Locale.US) ?: return false
+        return ext in setOf("png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff")
+    }
+
     // ------------------------------------------------------------ 输出
 
     /**
      * 生成默认输出绝对路径：原文件名 + 算法参数。
+     *
      * 例如 video.mp4 + RealESRGAN(animevideov3, x4)
      *   → /storage/emulated/0/Video2x/video_realesrgan-animevideov3-x4.mp4
+     *
+     * 图片输入则统一输出 `.png`（无损，且与 native 侧选用的 png 编码器一致）——
+     * 若沿用输入扩展名（如 .jpg），会出现「文件名是 jpg、内容实际是 PNG」的错配。
      */
     @Suppress("LongParameterList")
     fun buildOutputPath(
@@ -108,9 +147,14 @@ object FileBridge {
         height: Int,
         frameMultiplier: Int,
         shader: String,
+        isImage: Boolean = false,
     ): String {
         val base = inputName.substringBeforeLast('.', inputName)
-        val ext = inputName.substringAfterLast('.', "mp4").ifBlank { "mp4" }
+        val ext = if (isImage) {
+            "png"
+        } else {
+            inputName.substringAfterLast('.', "mp4").ifBlank { "mp4" }
+        }
 
         val suffix = when (algo) {
             Algo.REALESRGAN -> "realesrgan-$model-x$scale"
