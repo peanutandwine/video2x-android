@@ -84,7 +84,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var permGranted by mutableStateOf(true)
         private set
 
-    var algo by mutableStateOf(Algo.REALESRGAN)
+    // 默认算法：Anime4K —— 无需神经网络推理，速度远快于 Real-ESRGAN
+    //（实测 Anime4K x2 约 8 fps，Real-ESRGAN x2 约 0.18 fps），
+    // 默认着色器为 anime4k-v4-a（快速档）。
+    var algo by mutableStateOf(Algo.ANIME4K)
 
     // Real-ESRGAN
     var esrganModelId by mutableStateOf(Catalogs.esrganModels.first().id)
