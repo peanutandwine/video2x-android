@@ -18,8 +18,8 @@ android {
         applicationId = "com.video2x.android"
         minSdk = 26
         targetSdk = 35
-        versionCode = 7
-        versionName = "0.3.1"
+        versionCode = 9
+        versionName = "0.4.1"
 
         // 只做 arm64-v8a：v7a 无实用价值，x86_64 仅模拟器需要
         ndk {

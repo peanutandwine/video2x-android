@@ -7,16 +7,20 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -57,10 +61,25 @@ import kotlinx.coroutines.withContext
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // 显式进入 edge-to-edge。Android 15（targetSdk 35）本就强制，
+        // 这里统一开启，让 Android 8~14 上的表现与 15 保持一致 ——
+        // 否则低版本上状态栏是不透明的系统色，界面观感会不统一。
+        enableEdgeToEdge()
+
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    MainScreen()
+                    // 用 safeDrawing 一次性避开：状态栏、导航栏、刘海、输入法。
+                    // （此前没有这层 inset padding，内容会直接绘制到状态栏底下，
+                    //   表现为标题被通知栏/系统栏盖住。）
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .windowInsetsPadding(WindowInsets.safeDrawing)
+                    ) {
+                        MainScreen()
+                    }
                 }
             }
         }
@@ -276,6 +295,17 @@ private fun MainScreen(vm: MainViewModel = viewModel()) {
     val context = LocalContext.current
     val status by vm.status.collectAsState()
 
+    // ---- 检查更新：启动时自动查询一次（可在设置页关闭，也可在设置页手动触发） ----
+    val currentVersion = remember { UpdateChecker.currentVersion(context) }
+    var updateInfo by remember { mutableStateOf<UpdateInfo?>(null) }
+
+    LaunchedEffect(Unit) {
+        if (!AppSettings.autoCheckUpdate(context)) return@LaunchedEffect
+        // 网络请求放 IO 线程；「已是最新」与「检查失败」都静默忽略，不打扰启动
+        val result = withContext(Dispatchers.IO) { UpdateChecker.check(context) }
+        if (result is UpdateCheckResult.Available) updateInfo = result.info
+    }
+
     // 从「设置 → 所有文件访问」返回时刷新权限状态
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -379,6 +409,15 @@ private fun MainScreen(vm: MainViewModel = viewModel()) {
             onBack = { showSettings = false },
         )
         return
+    }
+
+    // 自动检查发现新版本时的弹窗（设置页手动检查有自己的弹窗）
+    updateInfo?.let { info ->
+        UpdateDialog(
+            info = info,
+            currentVersion = currentVersion,
+            onDismiss = { updateInfo = null },
+        )
     }
 
     Column(
