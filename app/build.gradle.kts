@@ -18,11 +18,8 @@ android {
         applicationId = "com.video2x.android"
         minSdk = 26
         targetSdk = 35
-        // versionName 保持 0.3.0（本次只是默认值调整，覆盖同一版本发布）；
-        // versionCode 必须递增 —— Android 要求新包的 versionCode ≥ 已安装版本，
-        // 否则覆盖安装会被拒绝。
-        versionCode = 6
-        versionName = "0.3.0"
+        versionCode = 7
+        versionName = "0.3.1"
 
         // 只做 arm64-v8a：v7a 无实用价值，x86_64 仅模拟器需要
         ndk {

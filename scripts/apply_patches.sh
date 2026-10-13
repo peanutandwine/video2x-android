@@ -322,4 +322,61 @@ print("[patch] filter_realesrgan.cpp: 已注入分段计时与 tilesize 诊断")
 PY
 fi
 
+# -----------------------------------------------------------------------------
+# 修复 5：进度计数在 EAGAIN 时重复累加（表现为 860/859）
+#
+# 现象：任务结束/接近结束时，进度显示的处理帧数比总帧数还多 1。
+#
+# 原因：VideoProcessor::process_frames() 的主循环里，无论处理器是否真的产出了
+# 帧，都会执行一次 frame_idx_.fetch_add(1)。而 libplacebo（Anime4K）的 filter
+# graph 存在内部延迟 —— av_buffersink_get_frame() 会返回 AVERROR(EAGAIN)，
+# 语义是「输入帧已收下，输出尚未就绪」。被延迟的那一帧会在 flush() 阶段
+# 吐出、写入编码器并**再次**计数。结果：同一帧计两次、只写一次。
+#
+# 佐证：x264 结束时打印的统计（frame I + P + B 之和）等于真实输出帧数，
+# 且与 total_frames_ 一致 —— 说明多出来的那次纯属重复计数，输出本身正确。
+#
+# 这也解释了为何 Real-ESRGAN 不出现该现象：ncnn 是同步处理，不会返回 EAGAIN。
+# -----------------------------------------------------------------------------
+L2X="$WORK_DIR/video2x/src/libvideo2x.cpp"
+if [ -f "$L2X" ]; then
+python3 - "$L2X" <<'PY'
+import pathlib, sys
+
+path = pathlib.Path(sys.argv[1])
+src = path.read_text(encoding="utf-8")
+
+if "EAGAIN 不计入进度" in src:
+    print("[patch] libvideo2x.cpp: EAGAIN 计数修复已存在，跳过")
+    sys.exit(0)
+
+ANCHOR = """                av_frame_unref(frame.get());
+                frame_idx_.fetch_add(1);
+"""
+
+if src.count(ANCHOR) != 1:
+    print(f"[patch] libvideo2x.cpp: 锚点命中 {src.count(ANCHOR)} 次（期望 1），跳过")
+    sys.exit(0)
+
+INJECT = """                av_frame_unref(frame.get());
+
+                // EAGAIN 不计入进度：处理器的 filter graph 有内部延迟
+                //（libplacebo 尤其明显），此时输入已被收下、输出尚未就绪。
+                // 该帧的实际产出会在后续调用或 flush() 阶段写入并计数，
+                // 此处若也累加会让计数超出总数（表现为 860/859）。
+                if (ret == AVERROR(EAGAIN)) {
+                    continue;
+                }
+
+                frame_idx_.fetch_add(1);
+"""
+
+src = src.replace(ANCHOR, INJECT, 1)
+path.write_text(src, encoding="utf-8")
+print("[patch] libvideo2x.cpp: 已修复 EAGAIN 时的重复计数")
+PY
+else
+  echo "[patch] 未找到 libvideo2x.cpp，跳过"
+fi
+
 log "补丁应用完成"

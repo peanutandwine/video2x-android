@@ -186,7 +186,7 @@ cd ..
 > `lintVitalRelease` —— 这是为了适配 8 GB 内存上限的环境。如果你的机器内存充裕，
 > 可以把 `org.gradle.jvmargs` 的 `-Xmx` 调回 4g 并重新打开 lint 检查。
 
-**逐步的过程、以及过程中踩到的 18 个坑（每个都有现象 / 原因 / 解决），都在 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)。** 这份文档对想自己编译的人价值最大，建议先读它再动手。
+**逐步的过程、以及过程中踩到的 19 个坑（每个都有现象 / 原因 / 解决），都在 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)。** 这份文档对想自己编译的人价值最大，建议先读它再动手。
 
 ## 已知限制
 
