@@ -48,6 +48,11 @@ data class ProcessRequest(
     val codec: String,
     val bitRate: Long,
     /**
+     * 旋转 / 翻转位掩码（仅视频）：0 = 不旋转（走超分）；非 0 走纯软件旋转管线。
+     * 1=顺时针90°  2=逆时针90°  4=水平翻转  8=垂直翻转，可自由组合。
+     */
+    val transform: Int = 0,
+    /**
      * 输入是否为单帧静态图片。
      * 图片与视频走同一条 native 管线（FFmpeg 把图片解复用为只有 1 帧的视频流），
      * 但对目标尺寸的探测方式、以及是否需要码率/硬件编码预检都不同。
@@ -211,20 +216,31 @@ class ProcessingService : Service() {
             publish(ProcessStatus(running = true, message = "初始化模型…"))
 
             val worker = async(Dispatchers.IO) {
-                Video2XNative.process(
-                    inFile.absolutePath,
-                    outFile.absolutePath,
-                    req.algo.id,
-                    req.model,
-                    req.scale,
-                    req.noiseLevel,
-                    nativeW,
-                    nativeH,
-                    req.frameMultiplier,
-                    req.shader,
-                    req.codec,
-                    effectiveBitRate,
-                )
+                if (req.transform != 0) {
+                    // 旋转 / 翻转：纯软件编码（libx264），规避 GPU 卡死
+                    Video2XNative.rotateVideo(
+                        inFile.absolutePath,
+                        outFile.absolutePath,
+                        req.transform,
+                        "libx264",
+                        if (req.bitRate > 0) req.bitRate else 8_000_000L,
+                    )
+                } else {
+                    Video2XNative.process(
+                        inFile.absolutePath,
+                        outFile.absolutePath,
+                        req.algo.id,
+                        req.model,
+                        req.scale,
+                        req.noiseLevel,
+                        nativeW,
+                        nativeH,
+                        req.frameMultiplier,
+                        req.shader,
+                        req.codec,
+                        effectiveBitRate,
+                    )
+                }
             }
 
             // 处理期间周期性落盘：每 10 秒一行，含瞬时帧率与 ETA。

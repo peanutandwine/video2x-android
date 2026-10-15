@@ -172,6 +172,22 @@ object FileBridge {
         return "$OUTPUT_DIR/${base}_$suffix.$ext"
     }
 
+    /**
+     * 生成旋转 / 翻转任务的默认输出绝对路径：原文件名 + rotate_<描述>。
+     * @param transform 位掩码：1=顺时针90° 2=逆时针90° 4=水平翻转 8=垂直翻转
+     */
+    fun buildRotatePath(inputName: String, transform: Int): String {
+        val base = inputName.substringBeforeLast('.', inputName)
+        val ext = inputName.substringAfterLast('.', "mp4").ifBlank { "mp4" }
+        val parts = mutableListOf<String>()
+        if (transform and 1 != 0) parts += "cw90"
+        if (transform and 2 != 0) parts += "ccw90"
+        if (transform and 4 != 0) parts += "hflip"
+        if (transform and 8 != 0) parts += "vflip"
+        val desc = if (parts.isEmpty()) "rotate" else parts.joinToString("_")
+        return "$OUTPUT_DIR/${base}_rotate-$desc.$ext"
+    }
+
     /** 清理临时文件 */
     fun cleanup(context: Context) {
         workDir(context).listFiles()?.forEach { it.delete() }

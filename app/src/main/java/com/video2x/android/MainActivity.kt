@@ -25,8 +25,12 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -107,6 +111,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     //（实测 Anime4K x2 约 8 fps，Real-ESRGAN x2 约 0.18 fps），
     // 默认着色器为 anime4k-v4-a（快速档）。
     var algo by mutableStateOf(Algo.ANIME4K)
+
+    /** 旋转 / 翻转位掩码（视频旋转功能用）：1=顺时针90° 2=逆时针90° 4=水平翻转 8=垂直翻转 */
+    var rotateTransform by mutableStateOf(0)
 
     // Real-ESRGAN
     var esrganModelId by mutableStateOf(Catalogs.esrganModels.first().id)
@@ -243,6 +250,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         isImage = isImageInput,
     )
 
+    /** 旋转任务的输出路径（随 rotateTransform 变化） */
+    fun rotateOutputPath(inputName: String): String =
+        FileBridge.buildRotatePath(inputName, rotateTransform)
+
     fun start(outPath: String) {
         if (ProcessBus.status.value.running) return
         val ctx = getApplication<Application>()
@@ -273,6 +284,41 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         )
         ProcessBus.status.value = ProcessStatus(running = true, message = "启动中…")
 
+        ContextCompat.startForegroundService(
+            ctx,
+            Intent(ctx, ProcessingService::class.java),
+        )
+    }
+
+    fun startRotate(outPath: String) {
+        if (ProcessBus.status.value.running) return
+        val ctx = getApplication<Application>()
+        val inU = inputUri ?: return
+
+        val logPath = FileBridge.newLogFilePath()
+        lastLogPath = logPath
+        if (!Video2XNative.setLogFile(logPath)) {
+            prepareMessage = "日志文件创建失败：$logPath（请检查「所有文件访问」权限）"
+        }
+
+        ProcessBus.request = ProcessRequest(
+            inUri = inU.toString(),
+            outPath = outPath,
+            logPath = logPath,
+            algo = Algo.ANIME4K,
+            model = "",
+            scale = 0,
+            noiseLevel = -1,
+            width = 0,
+            height = 0,
+            frameMultiplier = 1,
+            shader = "",
+            codec = "libx264",
+            bitRate = bitRateText.toLongOrNull() ?: 0L,
+            transform = rotateTransform,
+            isImage = false,
+        )
+        ProcessBus.status.value = ProcessStatus(running = true, message = "启动中…")
         ContextCompat.startForegroundService(
             ctx,
             Intent(ctx, ProcessingService::class.java),
@@ -393,6 +439,8 @@ private fun MainScreen(vm: MainViewModel = viewModel()) {
 
     // RIFE 模型是按需导入的，进出设置页都要重新扫描一次
     var showSettings by remember { mutableStateOf(false) }
+    var showRotate by remember { mutableStateOf(false) }
+    var showMenu by remember { mutableStateOf(false) }
     var rifeInstalled by remember { mutableStateOf(RifeModels.installed(context)) }
 
     // 已导入的模型与当前选择不一致时（刚导入、或换了一批模型），自动切到第一个
@@ -408,6 +456,11 @@ private fun MainScreen(vm: MainViewModel = viewModel()) {
             onImported = { rifeInstalled = RifeModels.installed(context) },
             onBack = { showSettings = false },
         )
+        return
+    }
+
+    if (showRotate) {
+        RotationScreen(onBack = { showRotate = false })
         return
     }
 
@@ -433,7 +486,30 @@ private fun MainScreen(vm: MainViewModel = viewModel()) {
                 style = MaterialTheme.typography.headlineSmall,
                 modifier = Modifier.weight(1f),
             )
-            OutlinedButton(onClick = { showSettings = true }) { Text("设置") }
+            Box {
+                IconButton(onClick = { showMenu = true }) {
+                    Icon(Icons.Default.MoreVert, contentDescription = "菜单")
+                }
+                DropdownMenu(
+                    expanded = showMenu,
+                    onDismissRequest = { showMenu = false },
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("设置") },
+                        onClick = {
+                            showMenu = false
+                            showSettings = true
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("视频旋转") },
+                        onClick = {
+                            showMenu = false
+                            showRotate = true
+                        },
+                    )
+                }
+            }
         }
         Text(
             "视频超分 / 插帧（基于 libvideo2x + FFmpeg + ncnn/Vulkan）",

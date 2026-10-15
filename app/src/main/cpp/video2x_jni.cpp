@@ -19,7 +19,9 @@
 #include <android/log.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
@@ -32,10 +34,17 @@
 #include <spdlog/sinks/base_sink.h>
 #include <spdlog/spdlog.h>
 
-// FFmpeg 头（AVHWDeviceType / av_get_pix_fmt_name）
+// FFmpeg 头：AVHWDeviceType / av_get_pix_fmt_name / 滤镜转码（avfilter/avformat/avcodec）
 extern "C" {
 #include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/opt.h>
+#include <libavutil/imgutils.h>
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersrc.h>
+#include <libavfilter/buffersink.h>
 }
 
 #include "libvideo2x/libvideo2x.h"
@@ -51,6 +60,40 @@ namespace {
 // 当前正在执行的处理器（个人使用场景下同时只允许一个任务）
 std::mutex g_mutex;
 std::shared_ptr<video2x::VideoProcessor> g_proc;
+
+// 旋转任务的独立中止标志（与超分任务的 g_proc 互不影响）
+std::atomic<bool> g_rotate_abort{false};
+
+// 旋转进度（供 UI 轮询；超分任务用 g_proc，旋转任务用这两个原子计数）
+std::atomic<long long> g_rotate_frames{0};
+std::atomic<long long> g_rotate_total{0};
+
+/**
+ * 在滤镜图中追加一个滤镜节点并连接到上一个节点。
+ * @return 新创建的滤镜上下文；失败返回 nullptr（调用方负责善后）
+ */
+AVFilterContext* append_filter(
+    AVFilterGraph* graph,
+    AVFilterContext* prev,
+    const char* name,
+    const char* args
+) {
+    const AVFilter* f = avfilter_get_by_name(name);
+    if (!f) {
+        LOGE("rotateVideo: filter '%s' not found", name);
+        return nullptr;
+    }
+    AVFilterContext* ctx = nullptr;
+    if (avfilter_graph_create_filter(&ctx, f, name, args, nullptr, graph) < 0) {
+        LOGE("rotateVideo: cannot create filter '%s'", name);
+        return nullptr;
+    }
+    if (prev && avfilter_link(prev, 0, ctx, 0) < 0) {
+        LOGE("rotateVideo: link to filter '%s' failed", name);
+        return nullptr;
+    }
+    return ctx;
+}
 
 std::string jstr(JNIEnv* env, jstring s) {
     if (s == nullptr) {
@@ -411,24 +454,368 @@ Java_com_video2x_android_Video2XNative_process(
 }
 
 // ---------------------------------------------------------------------------
+// 视频旋转 / 翻转（纯软件路径，使用 libavfilter + libx264，完全不经过
+// libplacebo / Vulkan —— 因此不会触发横屏超分场景下的 GPU 卡死）。
+//
+// transform 为位掩码：
+//   bit0 (1) = 顺时针旋转 90°（transpose=dir=1）
+//   bit1 (2) = 逆时针旋转 90°（transpose=dir=2）
+//   bit2 (4) = 水平翻转（hflip）
+//   bit3 (8) = 垂直翻转（vflip）
+// 各项可自由组合（例如 1+4 = 顺时针 90° + 水平翻转）。
+//
+// 视频流：解码 → 软件滤镜变换 → 重新编码（libx264，YUV420P）。
+// 音频流：直接 stream-copy，不重新编码，保留原内容。
+// 返回值：0 成功；-2 用户中止；负数对应 FFmpeg AVERROR；-1 为参数/异常错误。
+// ---------------------------------------------------------------------------
+JNIEXPORT jint JNICALL
+Java_com_video2x_android_Video2XNative_rotateVideo(
+    JNIEnv* env,
+    jobject /*thiz*/,
+    jstring in_path,
+    jstring out_path,
+    jint transform,
+    jstring codec,
+    jlong bit_rate
+) {
+    const std::string in = jstr(env, in_path);
+    const std::string out = jstr(env, out_path);
+    std::string codec_name = jstr(env, codec);
+
+    if (in.empty() || out.empty()) {
+        LOGE("rotateVideo: empty in/out path");
+        return -1;
+    }
+    if (transform == 0) {
+        LOGE("rotateVideo: no transform requested (transform=0)");
+        return -1;
+    }
+    if (codec_name.empty()) {
+        codec_name = "libx264";
+    }
+
+    g_rotate_abort.store(false);
+    g_rotate_frames.store(0);
+
+    AVFormatContext* ifmt = nullptr;
+    AVCodecContext* vdec_ctx = nullptr;
+    AVFormatContext* ofmt = nullptr;
+    AVFilterGraph* graph = nullptr;
+    AVFilterContext* src_ctx = nullptr;
+    AVFilterContext* sink_ctx = nullptr;
+    AVCodecContext* enc_ctx = nullptr;
+    AVPacket* pkt = nullptr;
+    AVPacket* epkt = nullptr;
+    AVFrame* frame = nullptr;
+    AVFrame* filt = nullptr;
+    int ret = -1;
+
+    // 以下变量提前声明，避免被下方的 goto cleanup 跳过初始化
+    int outW = 0, outH = 0;
+    AVRational outSar = {1, 1};
+    const AVCodec* enc = nullptr;
+    AVStream* vout = nullptr;
+    AVStream* aout = nullptr;
+    AVFilterContext* last = nullptr;
+    int videoIdx = -1, audioIdx = -1;
+    AVCodecParameters* vpar = nullptr;
+    const AVCodec* vdec = nullptr;
+    int inW = 0, inH = 0;
+    AVRational inSar = {1, 1};
+    AVRational inTb = {1, 1};
+    AVRational inFr = {1, 1};
+    int64_t totalFrames = 0;
+    int64_t outPts = 0;
+    bool aborted = false;
+
+    if (avformat_open_input(&ifmt, in.c_str(), nullptr, nullptr) != 0) {
+        LOGE("rotateVideo: cannot open input %s", in.c_str());
+        return -1;
+    }
+    if (avformat_find_stream_info(ifmt, nullptr) < 0) {
+        LOGE("rotateVideo: cannot find stream info");
+        goto cleanup;
+    }
+
+    for (unsigned i = 0; i < ifmt->nb_streams; i++) {
+        const auto type = ifmt->streams[i]->codecpar->codec_type;
+        if (type == AVMEDIA_TYPE_VIDEO && videoIdx < 0) videoIdx = static_cast<int>(i);
+        else if (type == AVMEDIA_TYPE_AUDIO && audioIdx < 0) audioIdx = static_cast<int>(i);
+    }
+    if (videoIdx < 0) {
+        LOGE("rotateVideo: no video stream found");
+        goto cleanup;
+    }
+
+    vpar = ifmt->streams[videoIdx]->codecpar;
+    vdec = avcodec_find_decoder(vpar->codec_id);
+    if (!vdec) {
+        LOGE("rotateVideo: video decoder not found (%d)", static_cast<int>(vpar->codec_id));
+        goto cleanup;
+    }
+    vdec_ctx = avcodec_alloc_context3(vdec);
+    avcodec_parameters_to_context(vdec_ctx, vpar);
+    if (avcodec_open2(vdec_ctx, vdec, nullptr) < 0) {
+        LOGE("rotateVideo: cannot open video decoder");
+        goto cleanup;
+    }
+
+    inW = vdec_ctx->width;
+    inH = vdec_ctx->height;
+    inSar = vdec_ctx->sample_aspect_ratio;
+    inTb = ifmt->streams[videoIdx]->time_base;
+    inFr = vdec_ctx->framerate;
+    if (inFr.num == 0) {
+        inFr = av_guess_frame_rate(ifmt, ifmt->streams[videoIdx], nullptr);
+    }
+    if (inFr.num == 0 || inFr.den == 0) {
+        inFr = (AVRational){30, 1};
+    }
+    totalFrames = ifmt->streams[videoIdx]->nb_frames;
+
+    if (avformat_alloc_output_context2(&ofmt, nullptr, nullptr, out.c_str()) < 0) {
+        LOGE("rotateVideo: cannot alloc output context for %s", out.c_str());
+        goto cleanup;
+    }
+
+    // ---- 滤镜图：buffer → [transpose/hflip/vflip...] → buffersink ----
+    graph = avfilter_graph_alloc();
+    if (!graph) {
+        LOGE("rotateVideo: cannot alloc filter graph");
+        goto cleanup;
+    }
+    char bufargs[320];
+    std::snprintf(bufargs, sizeof(bufargs),
+             "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:frame_rate=%d/%d:pixel_aspect=%d/%d",
+             inW, inH, vdec_ctx->pix_fmt,
+             inTb.num, inTb.den,
+             inFr.num, inFr.den,
+             inSar.num ? inSar.num : 1, inSar.den ? inSar.den : 1);
+
+    if (avfilter_graph_create_filter(&src_ctx, avfilter_get_by_name("buffer"), "in", bufargs, nullptr, graph) < 0 ||
+        avfilter_graph_create_filter(&sink_ctx, avfilter_get_by_name("buffersink"), "out", nullptr, nullptr, graph) < 0) {
+        LOGE("rotateVideo: cannot create buffer src/sink");
+        goto cleanup;
+    }
+
+    last = src_ctx;
+    if (transform & 1) {  // 顺时针 90°
+        last = append_filter(graph, last, "transpose", "dir=1");
+        if (!last) goto cleanup;
+    }
+    if (transform & 2) {  // 逆时针 90°
+        last = append_filter(graph, last, "transpose", "dir=2");
+        if (!last) goto cleanup;
+    }
+    if (transform & 4) {  // 水平翻转
+        last = append_filter(graph, last, "hflip", "");
+        if (!last) goto cleanup;
+    }
+    if (transform & 8) {  // 垂直翻转
+        last = append_filter(graph, last, "vflip", "");
+        if (!last) goto cleanup;
+    }
+    if (avfilter_link(last, 0, sink_ctx, 0) < 0) {
+        LOGE("rotateVideo: link to buffersink failed");
+        goto cleanup;
+    }
+    if (avfilter_graph_config(graph, nullptr) < 0) {
+        LOGE("rotateVideo: filter graph config failed");
+        goto cleanup;
+    }
+
+    outW = av_buffersink_get_w(sink_ctx);
+    outH = av_buffersink_get_h(sink_ctx);
+    outSar = av_buffersink_get_sample_aspect_ratio(sink_ctx);
+    LOGI("rotateVideo: %dx%d sar=%d/%d -> %dx%d (transform=0x%x codec=%s)",
+         inW, inH, inSar.num, inSar.den, outW, outH, static_cast<unsigned>(transform), codec_name.c_str());
+
+    // ---- 视频编码器 ----
+    enc = avcodec_find_encoder_by_name(codec_name.c_str());
+    if (!enc) {
+        LOGE("rotateVideo: encoder '%s' not found", codec_name.c_str());
+        goto cleanup;
+    }
+    enc_ctx = avcodec_alloc_context3(enc);
+    enc_ctx->codec_type = AVMEDIA_TYPE_VIDEO;
+    enc_ctx->codec_id = enc->id;
+    enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    enc_ctx->width = outW;
+    enc_ctx->height = outH;
+    enc_ctx->bit_rate = bit_rate > 0 ? bit_rate : 8LL * 1000 * 1000;  // 默认 8 Mbps
+    enc_ctx->rc_max_rate = enc_ctx->bit_rate;
+    enc_ctx->rc_buffer_size = static_cast<int>(enc_ctx->bit_rate * 2);
+    if (inFr.num != 0) {
+        enc_ctx->time_base.num = inFr.den;
+        enc_ctx->time_base.den = inFr.num;
+    } else {
+        enc_ctx->time_base = (AVRational){1, 30};
+    }
+    enc_ctx->gop_size = 30;
+    enc_ctx->max_b_frames = 2;
+    enc_ctx->thread_count = 0;  // 自动
+    if (avcodec_open2(enc_ctx, enc, nullptr) < 0) {
+        LOGE("rotateVideo: cannot open encoder");
+        goto cleanup;
+    }
+
+    vout = avformat_new_stream(ofmt, nullptr);
+    avcodec_parameters_from_context(vout->codecpar, enc_ctx);
+    vout->time_base = enc_ctx->time_base;
+    vout->sample_aspect_ratio = outSar;
+
+    // ---- 音频流 copy ----
+    if (audioIdx >= 0) {
+        aout = avformat_new_stream(ofmt, nullptr);
+        avcodec_parameters_copy(aout->codecpar, ifmt->streams[audioIdx]->codecpar);
+        aout->codecpar->codec_tag = 0;
+        aout->time_base = ifmt->streams[audioIdx]->time_base;
+    }
+
+    if (!(ofmt->oformat->flags & AVFMT_NOFILE)) {
+        if (avio_open(&ofmt->pb, out.c_str(), AVIO_FLAG_WRITE) < 0) {
+            LOGE("rotateVideo: cannot open output file %s", out.c_str());
+            goto cleanup;
+        }
+    }
+    if (avformat_write_header(ofmt, nullptr) < 0) {
+        LOGE("rotateVideo: write header failed");
+        goto cleanup;
+    }
+
+    g_rotate_total.store(totalFrames > 0 ? totalFrames : 0);
+
+    pkt = av_packet_alloc();
+    epkt = av_packet_alloc();
+    frame = av_frame_alloc();
+    filt = av_frame_alloc();
+    if (!pkt || !epkt || !frame || !filt) {
+        LOGE("rotateVideo: alloc failed");
+        goto cleanup;
+    }
+
+    while (!g_rotate_abort.load()) {
+        ret = av_read_frame(ifmt, pkt);
+        if (ret < 0) break;  // EOF 或错误
+        if (pkt->stream_index == videoIdx) {
+            if (avcodec_send_packet(vdec_ctx, pkt) < 0) {
+                av_packet_unref(pkt);
+                continue;
+            }
+            while (avcodec_receive_frame(vdec_ctx, frame) == 0) {
+                if (g_rotate_abort.load()) break;
+                if (av_buffersrc_add_frame(src_ctx, frame) < 0) {
+                    LOGE("rotateVideo: buffersrc add frame failed");
+                    av_packet_unref(pkt);
+                    goto cleanup;
+                }
+                while (av_buffersink_get_frame(sink_ctx, filt) == 0) {
+                    filt->pts = outPts++;
+                    if (avcodec_send_frame(enc_ctx, filt) < 0) {
+                        LOGE("rotateVideo: enc send frame failed");
+                        av_frame_unref(filt);
+                        break;
+                    }
+                    while (avcodec_receive_packet(enc_ctx, epkt) == 0) {
+                        av_packet_rescale_ts(epkt, enc_ctx->time_base, vout->time_base);
+                        epkt->stream_index = vout->index;
+                        av_interleaved_write_frame(ofmt, epkt);
+                        av_packet_unref(epkt);
+                    }
+                    av_frame_unref(filt);
+                    g_rotate_frames.fetch_add(1);
+                }
+            }
+        } else if (pkt->stream_index == audioIdx) {
+            av_packet_rescale_ts(pkt, ifmt->streams[audioIdx]->time_base, aout->time_base);
+            pkt->stream_index = aout->index;
+            av_interleaved_write_frame(ofmt, pkt);
+        }
+        av_packet_unref(pkt);
+    }
+
+    if (g_rotate_abort.load()) {
+        aborted = true;
+    } else {
+        // ---- flush 解码器 / 滤镜 / 编码器 ----
+        avcodec_send_packet(vdec_ctx, nullptr);
+        while (avcodec_receive_frame(vdec_ctx, frame) == 0) {
+            av_buffersrc_add_frame(src_ctx, frame);
+            while (av_buffersink_get_frame(sink_ctx, filt) == 0) {
+                filt->pts = outPts++;
+                avcodec_send_frame(enc_ctx, filt);
+                while (avcodec_receive_packet(enc_ctx, epkt) == 0) {
+                    av_packet_rescale_ts(epkt, enc_ctx->time_base, vout->time_base);
+                    epkt->stream_index = vout->index;
+                    av_interleaved_write_frame(ofmt, epkt);
+                    av_packet_unref(epkt);
+                }
+                av_frame_unref(filt);
+                g_rotate_frames.fetch_add(1);
+            }
+        }
+        av_buffersrc_add_frame(src_ctx, nullptr);
+        while (av_buffersink_get_frame(sink_ctx, filt) == 0) {
+            filt->pts = outPts++;
+            avcodec_send_frame(enc_ctx, filt);
+            while (avcodec_receive_packet(enc_ctx, epkt) == 0) {
+                av_packet_rescale_ts(epkt, enc_ctx->time_base, vout->time_base);
+                epkt->stream_index = vout->index;
+                av_interleaved_write_frame(ofmt, epkt);
+                av_packet_unref(epkt);
+            }
+            av_frame_unref(filt);
+            g_rotate_frames.fetch_add(1);
+        }
+        avcodec_send_frame(enc_ctx, nullptr);
+        while (avcodec_receive_packet(enc_ctx, epkt) == 0) {
+            av_packet_rescale_ts(epkt, enc_ctx->time_base, vout->time_base);
+            epkt->stream_index = vout->index;
+            av_interleaved_write_frame(ofmt, epkt);
+            av_packet_unref(epkt);
+        }
+    }
+
+    av_write_trailer(ofmt);
+    ret = aborted ? -2 : 0;
+
+cleanup:
+    if (frame) av_frame_free(&frame);
+    if (filt) av_frame_free(&filt);
+    if (pkt) av_packet_free(&pkt);
+    if (epkt) av_packet_free(&epkt);
+    if (enc_ctx) avcodec_free_context(&enc_ctx);
+    if (graph) avfilter_graph_free(&graph);
+    if (vdec_ctx) avcodec_free_context(&vdec_ctx);
+    if (ofmt) {
+        if (ofmt->pb && !(ofmt->oformat->flags & AVFMT_NOFILE)) avio_closep(&ofmt->pb);
+        avformat_free_context(ofmt);
+    }
+    if (ifmt) avformat_close_input(&ifmt);
+
+    LOGI("rotateVideo finished, ret=%d aborted=%d", ret, (int)g_rotate_abort.load());
+    return ret;
+}
+
+// ---------------------------------------------------------------------------
 // 进度查询 / 中止
 // ---------------------------------------------------------------------------
 JNIEXPORT jlong JNICALL
 Java_com_video2x_android_Video2XNative_getProcessedFrames(JNIEnv* /*env*/, jobject /*thiz*/) {
     std::lock_guard<std::mutex> lk(g_mutex);
-    if (!g_proc) {
-        return 0;
+    if (g_proc) {
+        return static_cast<jlong>(g_proc->get_processed_frames());
     }
-    return static_cast<jlong>(g_proc->get_processed_frames());
+    return static_cast<jlong>(g_rotate_frames.load());
 }
 
 JNIEXPORT jlong JNICALL
 Java_com_video2x_android_Video2XNative_getTotalFrames(JNIEnv* /*env*/, jobject /*thiz*/) {
     std::lock_guard<std::mutex> lk(g_mutex);
-    if (!g_proc) {
-        return 0;
+    if (g_proc) {
+        return static_cast<jlong>(g_proc->get_total_frames());
     }
-    return static_cast<jlong>(g_proc->get_total_frames());
+    return static_cast<jlong>(g_rotate_total.load());
 }
 
 JNIEXPORT jint JNICALL
@@ -445,8 +832,10 @@ Java_com_video2x_android_Video2XNative_abort(JNIEnv* /*env*/, jobject /*thiz*/) 
     std::lock_guard<std::mutex> lk(g_mutex);
     if (g_proc) {
         g_proc->abort();
-        LOGI("abort requested");
+        LOGI("abort requested (supersample)");
     }
+    g_rotate_abort.store(true);
+    LOGI("abort requested (rotate)");
 }
 
 }  // extern "C"

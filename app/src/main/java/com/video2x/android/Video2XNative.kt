@@ -60,6 +60,23 @@ object Video2XNative {
         bitRate: Long,
     ): Int
 
+    /**
+     * 视频旋转 / 翻转（纯软件路径：libavfilter + libx264，不经过 libplacebo / Vulkan，
+     * 因此不会触发横屏超分场景下的 GPU 卡死）。
+     *
+     * @param transform 位掩码：1=顺时针90°  2=逆时针90°  4=水平翻转  8=垂直翻转，可组合
+     * @param codec     视频编码器，旋转场景固定使用 libx264（软件编码）
+     * @param bitRate   视频码率（bit/s），<=0 时 native 侧回退到 8Mbps 默认值
+     * @return 0 成功；-2 用户中止；负数对应 FFmpeg AVERROR 或 -1 表示参数/异常错误
+     */
+    external fun rotateVideo(
+        inPath: String,
+        outPath: String,
+        transform: Int,
+        codec: String,
+        bitRate: Long,
+    ): Int
+
     external fun getProcessedFrames(): Long
 
     external fun getTotalFrames(): Long
