@@ -685,8 +685,8 @@ private fun MainScreen(vm: MainViewModel = viewModel()) {
                 singleLine = true,
             )
             Text(
-                "0 = 自动：按「输入码率 × 输出/输入像素比」推算（硬件编码需正码率）；" +
-                    "软编码 libx264 填 0 时走默认 CRF。",
+                "0 = 质量优先：libx264 走 CRF（可变码率自动缩体积）；" +
+                    "硬件编码无 CRF，按输出分辨率给质量目标码率 + VBR 缩减体积。",
                 style = MaterialTheme.typography.bodySmall,
             )
         } else {

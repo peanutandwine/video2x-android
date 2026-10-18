@@ -173,19 +173,16 @@ class ProcessingService : Service() {
             val nativeW = if (req.algo.needsDimensions) outW else 0
             val nativeH = if (req.algo.needsDimensions) outH else 0
 
-            // ---- 码率解析 ----
-            // 图片输出是 PNG（无损），没有码率概念；视频则：
-            //  · 用户填 > 0           → 用用户值
-            //  · 填 0 + 硬件编码      → 按「输入码率 × 输出/输入像素比」推算。
-            //    MediaCodec 必须拿到正码率，无法像 libx264 那样走"自动"。
-            //  · 填 0 + 软编码        → 传 0，交给 libx264 的默认 CRF（质量优先）
-            val autoBitRate =
-                if (req.isImage) 0L
-                else autoBitRateFor(srcBitRate, inW, inH, outW, outH)
+            // ---- 码率解析（质量优先 / VBR，目标：缩减输出体积）----
+            //  · 图片输出是 PNG（无损），没有码率概念 → 0
+            //  · 用户显式填 > 0      → 用用户值（作为 VBR 目标 / 固定码率，由用户掌控）
+            //  · 填 0 + 软编码        → 传 0，原生层对 libx264 走 CRF（VBR 质量优先，自动缩体积）
+            //  · 填 0 + 硬件编码      → MediaCodec 无 CRF，按「输出分辨率」给质量目标码率，
+            //                          Android 默认 VBR 在简单帧自动降码率，缩小体积
             val effectiveBitRate = when {
                 req.isImage -> 0L
                 req.bitRate > 0 -> req.bitRate
-                req.codec.contains("mediacodec") -> autoBitRate
+                req.codec.contains("mediacodec") -> defaultBitRateFor(outW, outH)
                 else -> 0L
             }
 
@@ -217,13 +214,14 @@ class ProcessingService : Service() {
 
             val worker = async(Dispatchers.IO) {
                 if (req.transform != 0) {
-                    // 旋转 / 翻转：纯软件编码（libx264），规避 GPU 卡死
+                    // 旋转 / 翻转：纯软件编码（libx264），规避 GPU 卡死。
+                    // 码率填 0 时原生层走 CRF（VBR 质量优先），自动缩减体积。
                     Video2XNative.rotateVideo(
                         inFile.absolutePath,
                         outFile.absolutePath,
                         req.transform,
                         "libx264",
-                        if (req.bitRate > 0) req.bitRate else 8_000_000L,
+                        req.bitRate,
                     )
                 } else {
                     Video2XNative.process(
@@ -468,31 +466,23 @@ class ProcessingService : Service() {
     }
 
     /**
-     * 推算输出码率。
-     *
-     * 首选「输入码率 × 输出/输入像素比」—— 超分后像素数按倍率平方增长，
-     * 码率同比例放大才能维持单位像素质量；而 MediaCodec 又必须拿到正码率。
-     * 读不到输入码率时退化为按输出像素的经验值：约 0.08 bit/像素/帧
-     * （1080p30 ≈ 5 Mbps，2880x3840@30 ≈ 26 Mbps）。
+     * 硬件编码（MediaCodec）无 CRF，必须给正码率。这里仅按「输出分辨率」给一个
+     * 质量目标码率，作为 VBR 的平均目标 —— 不依赖输入码率，因此输入再高也不会
+     * 被放大成夸张码率（这正是此前「输入 × 像素比」算法体积失控的根源）。
+     * Android MediaCodec 默认即 VBR 模式，简单帧会自动降码率，进一步缩小体积。
      */
-    private fun autoBitRateFor(srcBr: Long, inW: Int, inH: Int, outW: Int, outH: Int): Long {
-        val outPx = outW.toLong() * outH
-        if (outPx <= 0) return 0L
-
-        // 用「每像素每帧比特数」给输出封顶。
-        // 只按像素比外推的话，输入本身是高码率时结果会离谱 ——
-        // 实测一例：输入 28.8 Mbps(1440x1920)，x2 按 4 倍算得 115 Mbps，
-        // 远超手机编码器的合理区间，文件也大到不可用。
-        // 0.15 bit/px/frame 大致对应 H.265 的高质量档。
-        val capByBpp = (outPx * ASSUMED_FPS * MAX_BITS_PER_PIXEL).toLong()
-
-        val est = if (srcBr > 0 && inW > 0 && inH > 0) {
-            val ratio = outPx.toDouble() / (inW.toDouble() * inH.toDouble())
-            minOf((srcBr * ratio).toLong(), capByBpp)
-        } else {
-            (outPx * ASSUMED_FPS * TARGET_BITS_PER_PIXEL).toLong()
+    private fun defaultBitRateFor(outW: Int, outH: Int): Long {
+        val longSide = maxOf(outW, outH).toLong()
+        if (longSide <= 0) return 6_000_000L
+        // 基于输出长边的经验质量目标（H.264 / H.265）：
+        //   720p ≈ 3 Mbps，1080p ≈ 6 Mbps，1440p ≈ 10 Mbps，2160p(4K) ≈ 18 Mbps
+        return when {
+            longSide <= 720  -> 3_000_000L
+            longSide <= 1080 -> 6_000_000L
+            longSide <= 1440 -> 10_000_000L
+            longSide <= 2160 -> 18_000_000L
+            else             -> ((longSide * longSide) / (2160.0 * 2160.0) * 18_000_000.0).toLong()
         }
-        return est.coerceIn(MIN_AUTO_BITRATE, MAX_AUTO_BITRATE)
     }
 
     /** 固定用 US locale 格式化，避免某些系统用逗号作小数分隔符 */
@@ -547,14 +537,5 @@ class ProcessingService : Service() {
 
         /** 硬件编码器的常见分辨率上限；超出后 MediaCodec 会 configure 失败(-10000) */
         private const val HW_MAX_DIM = 4096
-
-        /** 自动码率的下限与绝对上限（绝对上限兜住异常输入） */
-        private const val MIN_AUTO_BITRATE = 2_000_000L
-        private const val MAX_AUTO_BITRATE = 60_000_000L
-
-        /** 无输入码率时的经验目标值，以及按比例外推时的封顶值（单位 bit/像素/帧） */
-        private const val ASSUMED_FPS = 30.0
-        private const val TARGET_BITS_PER_PIXEL = 0.08
-        private const val MAX_BITS_PER_PIXEL = 0.15
     }
 }
