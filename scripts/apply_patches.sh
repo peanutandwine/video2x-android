@@ -422,4 +422,131 @@ else
   echo "[patch] 未找到 realesrgan.cpp，跳过"
 fi
 
+# -----------------------------------------------------------------------------
+# 补丁 7：RealESRGAN 非 int8 下载路径补 fp16→fp32（修复整帧全黑）
+#
+# 现象：关闭 int8 storage 后，RealESRGAN 输出整片黑色
+#   （x264 统计 P/B 帧 skip:100%、总码率约 188kbps）。
+#
+# 原因：record_clone(VkMat→Mat) 这条重载只做 memcpy，dst 由
+#   create_like(src) 按 src 布局建立 —— src 是 fp16，dst 也就成了 fp16。
+#   而 to_pixels 的实现 to_rgb() 用 const float* 按 fp32 逐像素读取，
+#   fp16 字节被当成极小的 float，饱和截断后全为 0，整帧变黑。
+#
+# 修复：非 int8 分支在 to_pixels 之前，若 elemsize==2 先
+#   cast_float16_to_float32 转成 fp32。
+# -----------------------------------------------------------------------------
+RE2="$WORK_DIR/video2x/third_party/librealesrgan_ncnn_vulkan/src/realesrgan.cpp"
+if [ -f "$RE2" ]; then
+python3 - "$RE2" <<'PY'
+import sys, pathlib
+
+path = pathlib.Path(sys.argv[1])
+src = path.read_text(encoding="utf-8")
+
+if "v2x_cast_fp16_download" in src:
+    print("[patch] realesrgan.cpp fp16 下载转换已存在，跳过")
+    sys.exit(0)
+
+OLD = '''            if (!(opt.use_fp16_storage && opt.use_int8_storage))
+            {
+                if (channels == 3)
+                {
+#if _WIN32
+                    out.to_pixels((unsigned char*)outimage.data + yi * scale * TILE_SIZE_Y * w * scale * channels, ncnn::Mat::PIXEL_RGB2BGR);
+#else
+                    out.to_pixels((unsigned char*)outimage.data + yi * scale * TILE_SIZE_Y * w * scale * channels, ncnn::Mat::PIXEL_RGB);
+#endif
+                }
+                if (channels == 4)
+                {
+#if _WIN32
+                    out.to_pixels((unsigned char*)outimage.data + yi * scale * TILE_SIZE_Y * w * scale * channels, ncnn::Mat::PIXEL_RGBA2BGRA);
+#else
+                    out.to_pixels((unsigned char*)outimage.data + yi * scale * TILE_SIZE_Y * w * scale * channels, ncnn::Mat::PIXEL_RGBA);
+#endif
+                }
+            }'''
+
+NEW = '''            if (!(opt.use_fp16_storage && opt.use_int8_storage))
+            {
+                // v2x_cast_fp16_download: record_clone 下载下来的是与 out_gpu
+                // 同布局的 fp16 Mat，而 to_pixels 只按 fp32 读取 —— 直接调用
+                // 会把 fp16 当成极小的 float，整帧变黑。先转 fp32。
+                ncnn::Mat out_fp32;
+                if (out.elemsize == 2u)
+                {
+                    ncnn::cast_float16_to_float32(out, out_fp32, opt);
+                }
+                const ncnn::Mat& pix = (out.elemsize == 2u) ? out_fp32 : out;
+
+                if (channels == 3)
+                {
+#if _WIN32
+                    pix.to_pixels((unsigned char*)outimage.data + yi * scale * TILE_SIZE_Y * w * scale * channels, ncnn::Mat::PIXEL_RGB2BGR);
+#else
+                    pix.to_pixels((unsigned char*)outimage.data + yi * scale * TILE_SIZE_Y * w * scale * channels, ncnn::Mat::PIXEL_RGB);
+#endif
+                }
+                if (channels == 4)
+                {
+#if _WIN32
+                    pix.to_pixels((unsigned char*)outimage.data + yi * scale * TILE_SIZE_Y * w * scale * channels, ncnn::Mat::PIXEL_RGBA2BGRA);
+#else
+                    pix.to_pixels((unsigned char*)outimage.data + yi * scale * TILE_SIZE_Y * w * scale * channels, ncnn::Mat::PIXEL_RGBA);
+#endif
+                }
+            }'''
+
+if OLD not in src:
+    print("[patch] realesrgan.cpp 未找到下载分支锚点", file=sys.stderr)
+    sys.exit(1)
+
+src = src.replace(OLD, NEW, 1)
+path.write_text(src, encoding="utf-8")
+print("[patch] realesrgan.cpp: 非 int8 下载路径已补 fp16->fp32")
+PY
+else
+  echo "[patch] 未找到 realesrgan.cpp，跳过"
+fi
+
+# -----------------------------------------------------------------------------
+# 补丁 8：RealESRGAN 强制 fp32 推理（绕过本设备异常的 fp16/int8 路径）
+#
+# 实测（同一视频、同一模型）：
+#   · use_int8_storage=true  → 画面被摊成多份平铺 + 灰色（int8 下载布局
+#     与 interleaved BGR 不匹配）
+#   · use_fp16_storage=true  → 整帧纯黑（此设备的 fp16 路径把结果算成 0，
+#     record_clone 下载到的 fp16 数据全为 0，转 fp32 后仍是 0）
+# fp32 是所有 Vulkan 设备都具备的基线路径，不依赖 fp16/int8 扩展。
+# -----------------------------------------------------------------------------
+RE3="$WORK_DIR/video2x/third_party/librealesrgan_ncnn_vulkan/src/realesrgan.cpp"
+if [ -f "$RE3" ]; then
+python3 - "$RE3" <<'PY'
+import sys, pathlib
+
+path = pathlib.Path(sys.argv[1])
+src = path.read_text(encoding="utf-8")
+
+if "net.opt.use_fp16_storage = false;" in src:
+    print("[patch] realesrgan.cpp 已强制 fp32，跳过")
+    sys.exit(0)
+
+pairs = [
+    ("net.opt.use_fp16_packed = true;", "net.opt.use_fp16_packed = false;"),
+    ("net.opt.use_fp16_storage = true;", "net.opt.use_fp16_storage = false;"),
+]
+for old, new in pairs:
+    if old not in src:
+        print("[patch] realesrgan.cpp 未找到锚点: " + old, file=sys.stderr)
+        sys.exit(1)
+    src = src.replace(old, new, 1)
+
+path.write_text(src, encoding="utf-8")
+print("[patch] realesrgan.cpp: 已强制 fp32（关闭 fp16 packed/storage）")
+PY
+else
+  echo "[patch] 未找到 realesrgan.cpp，跳过"
+fi
+
 log "补丁应用完成"
