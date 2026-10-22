@@ -642,9 +642,18 @@ Java_com_video2x_android_Video2XNative_rotateVideo(
     enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
     enc_ctx->width = outW;
     enc_ctx->height = outH;
-    enc_ctx->bit_rate = bit_rate > 0 ? bit_rate : 8LL * 1000 * 1000;  // 默认 8 Mbps
-    enc_ctx->rc_max_rate = enc_ctx->bit_rate;
-    enc_ctx->rc_buffer_size = static_cast<int>(enc_ctx->bit_rate * 2);
+
+    if (bit_rate > 0) {
+        // 用户显式指定码率：恒定码率（CBR-ish）模式
+        enc_ctx->bit_rate = bit_rate;
+        enc_ctx->rc_max_rate = bit_rate;
+        enc_ctx->rc_buffer_size = static_cast<int>(bit_rate * 2);
+    } else {
+        // 默认：CRF（恒定质量）模式——由 libx264 按画质自动计算码率，
+        // 无需手动推算。旋转/翻转是几何变换，理想近乎无损，取较低 CRF 保画质。
+        const double crf = 20.0;
+        av_opt_set_double(enc_ctx, "crf", crf, AV_OPT_SEARCH_CHILDREN);
+    }
     if (inFr.num != 0) {
         enc_ctx->time_base.num = inFr.den;
         enc_ctx->time_base.den = inFr.num;

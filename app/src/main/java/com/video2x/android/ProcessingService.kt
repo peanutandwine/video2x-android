@@ -301,15 +301,34 @@ class ProcessingService : Service() {
                     "s frames=$frameInfo",
             )
             if (ret == 0) {
-                // 通知媒体库刷新：输出目录是公共目录，但只写入文件并不会让
-                // 相册/图库立刻收录它，必须主动触发 MediaScanner。
-                notifyMediaScanner(outFile)
-                publish(
-                    ProcessStatus(
-                        running = false, done = true, success = true, progress = 1f,
-                        message = "完成：${outFile.name}",
+                // 假成功防护：上游 VideoProcessor 是预编译黑盒，曾多次出现
+                // 「只处理 0~1 帧就返回 ret=0」的情况（疑似输入解码早退）。
+                // 若实际处理帧数远低于总帧数，判定为失败，避免默默产出废文件。
+                val tooFew = finalTotal > 0 && finalFrames < finalTotal * 0.5
+                if (tooFew) {
+                    appendLog(
+                        req.logPath,
+                        "[app] aborted: 实际处理 $finalFrames/$finalTotal 帧（<50%），" +
+                            "疑似上游提前退出，判定失败",
                     )
-                )
+                    publish(
+                        ProcessStatus(
+                            running = false, done = true, success = false,
+                            progress = ProcessBus.status.value.progress,
+                            message = "处理异常：仅完成 $finalFrames/$finalTotal 帧，疑似输入无法完整解码",
+                        )
+                    )
+                } else {
+                    // 通知媒体库刷新：输出目录是公共目录，但只写入文件并不会让
+                    // 相册/图库立刻收录它，必须主动触发 MediaScanner。
+                    notifyMediaScanner(outFile)
+                    publish(
+                        ProcessStatus(
+                            running = false, done = true, success = true, progress = 1f,
+                            message = "完成：${outFile.name}",
+                        )
+                    )
+                }
             } else {
                 publish(
                     ProcessStatus(
@@ -481,7 +500,11 @@ class ProcessingService : Service() {
             longSide <= 1080 -> 6_000_000L
             longSide <= 1440 -> 10_000_000L
             longSide <= 2160 -> 18_000_000L
-            else             -> ((longSide * longSide) / (2160.0 * 2160.0) * 18_000_000.0).toLong()
+            // 长边超过 4K：按与 4K 的线性比例外推（而非面积平方，否则 8K 会爆到 200Mbps+），
+            // 并封顶 80Mbps，兼顾画质与体积。
+            else -> (18_000_000.0 + (longSide - 2160) / 1080.0 * 18_000_000.0)
+                .toLong()
+                .coerceAtMost(80_000_000L)
         }
     }
 

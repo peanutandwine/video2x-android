@@ -379,4 +379,47 @@ else
   echo "[patch] 未找到 libvideo2x.cpp，跳过"
 fi
 
+# -----------------------------------------------------------------------------
+# 补丁 6：RealESRGAN 关闭 int8 storage（修复输出画面错乱）
+#
+# 现象：RealESRGAN 输出画面顶部出现多份被拉伸平铺的小图，其余大面积灰色。
+#
+# 原因：realesrgan.cpp 的 init() 设 net.opt.use_int8_storage = true，但随包的
+#   realesr-animevideov3 系列模型并没有做 int8 量化（.param 里 int8_scale_term
+#   出现 0 次），实际张量是 fp16。process() 的下载分支按
+#       if (use_fp16_storage && use_int8_storage)
+#   判定为「int8 直通」，把 out_gpu（fp16、elempack 可能为 4）clone 进一个
+#   elemsize=3 / elempack=1 的紧凑 int8 Mat —— 两者的元素布局完全对不上，
+#   于是同一份结果被按 elempack 摊成多份（x4 时正好 4 份平铺），未覆盖区域
+#   保持未初始化的灰色（U=V=128）。
+#
+# 修复：把 use_int8_storage 置 false。这样 preproc/postproc 会切到 fp16s
+#   着色器变体，下载走 to_pixels(PIXEL_RGB) 标准路径，与 fp16 模型自洽。
+# -----------------------------------------------------------------------------
+RE="$WORK_DIR/video2x/third_party/librealesrgan_ncnn_vulkan/src/realesrgan.cpp"
+if [ -f "$RE" ]; then
+python3 - "$RE" <<'PY'
+import sys, pathlib
+
+path = pathlib.Path(sys.argv[1])
+src = path.read_text(encoding="utf-8")
+
+if "net.opt.use_int8_storage = false;" in src:
+    print("[patch] realesrgan.cpp int8_storage 已关闭，跳过")
+    sys.exit(0)
+
+OLD = "net.opt.use_int8_storage = true;"
+NEW = "net.opt.use_int8_storage = false;"
+if OLD not in src:
+    print("[patch] realesrgan.cpp 未找到 use_int8_storage 锚点", file=sys.stderr)
+    sys.exit(1)
+
+src = src.replace(OLD, NEW, 1)
+path.write_text(src, encoding="utf-8")
+print("[patch] realesrgan.cpp: use_int8_storage -> false（走 fp16 路径）")
+PY
+else
+  echo "[patch] 未找到 realesrgan.cpp，跳过"
+fi
+
 log "补丁应用完成"
