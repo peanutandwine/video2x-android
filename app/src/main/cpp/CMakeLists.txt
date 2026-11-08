@@ -50,18 +50,39 @@ endforeach()
 # ---------------------------------------------------------------------------
 add_library(video2x_jni SHARED
     video2x_jni.cpp
+    anime4k_jni.cpp
+    a4k/a4k_shader.cpp
+    a4k/a4k_plan.cpp
+    a4k/a4k_vk.cpp
 )
 
 target_include_directories(video2x_jni PRIVATE
     "${V2X_INC_DIR}"                 # 供 <spdlog/...> 等使用
     "${V2X_INC_DIR}/libvideo2x"      # 供 "libvideo2x.h" / "processor.h" 等使用
+    "${CMAKE_CURRENT_SOURCE_DIR}"    # anime4k_bridge.h
+    "${CMAKE_CURRENT_SOURCE_DIR}/a4k"
 )
 
 find_library(log_lib log)
 find_library(android_lib android)
+find_library(vulkan_lib vulkan)
+
+# glslang（静态库）：Anime4K 的 GLSL 在运行时编译为 SPIR-V。
+# 顺序有依赖：glslang 依赖 MachineIndependent / GenericCodeGen / OSDependent。
+set(GLSLANG_LIBS
+    "${V2X_LIB_DIR}/libglslang.a"
+    "${V2X_LIB_DIR}/libSPIRV.a"
+    "${V2X_LIB_DIR}/libMachineIndependent.a"
+    "${V2X_LIB_DIR}/libGenericCodeGen.a"
+    "${V2X_LIB_DIR}/libOSDependent.a"
+    "${V2X_LIB_DIR}/libSPVRemapper.a"
+    "${V2X_LIB_DIR}/libglslang-default-resource-limits.a"
+)
 
 target_link_libraries(video2x_jni PRIVATE
     ${V2X_IMPORTED}
+    ${GLSLANG_LIBS}
+    ${vulkan_lib}
     ${log_lib}
     ${android_lib}
 )
@@ -71,6 +92,9 @@ target_link_libraries(video2x_jni PRIVATE
 target_link_options(video2x_jni PRIVATE
     "-Wl,--allow-shlib-undefined"
     "-Wl,-z,max-page-size=16384"
+    # 静态库符号（glslang / libplacebo 的副本）隐藏起来，避免与
+    # libavfilter.so 内部那份 libplacebo/glslang 发生符号抢占。
+    "-Wl,--exclude-libs,ALL"
 )
 
 # libvideo2x.so 若以 -fopenmp 构建，会依赖 libomp.so。

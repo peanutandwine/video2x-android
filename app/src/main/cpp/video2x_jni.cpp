@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -47,6 +48,7 @@ extern "C" {
 #include <libavfilter/buffersink.h>
 }
 
+#include "anime4k_bridge.h"
 #include "libvideo2x/libvideo2x.h"
 #include "libvideo2x/logger_manager.h"
 #include "libvideo2x/processor.h"
@@ -263,6 +265,40 @@ Java_com_video2x_android_Video2XNative_setResourceDir(
         ::setenv("VIDEO2X_RESOURCE_DIR", d.c_str(), 1);
         LOGI("resource dir = %s", d.c_str());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Vulkan 能力探测 —— Anime4K / libplacebo 的前置条件
+//
+// ffmpeg 7.x 的 libavutil/hwcontext_vulkan 把 timeline semaphore 作为硬性要求
+//（hwcontext_vulkan.c： "We require timeline semaphores"），而 libplacebo 滤镜
+// 必须挂在一个由 ffmpeg 创建的 Vulkan hwdevice 上。部分设备（如骁龙865 的早期
+// Adreno 驱动）没有暴露 VK_KHR_timeline_semaphore，av_hwdevice_ctx_create 会在
+// 设备特性检查处直接返回 ENOSYS，随后的滤镜图配置必然失败：
+//     Device does not support timeline semaphores!
+//     Failed to create Vulkan hardware device context for libplacebo.
+//
+// 这里在任务开始前探测一次，让 UI 能把不可用的算法挡在门外，而不是让用户
+// 等到处理阶段才拿到一个错误码。
+//
+// 返回值：0 可用；负数不可用（FFmpeg AVERROR）。
+// 结果按进程缓存 —— 驱动能力在进程生命周期内不会变化。
+// ---------------------------------------------------------------------------
+JNIEXPORT jint JNICALL
+Java_com_video2x_android_Video2XNative_probeVulkan(JNIEnv*, jobject /*thiz*/) {
+    static std::atomic<int> cached{INT32_MIN};
+    const int prev = cached.load(std::memory_order_acquire);
+    if (prev != INT32_MIN) return prev;
+
+    AVBufferRef* dev_ctx = nullptr;
+    const int ret = av_hwdevice_ctx_create(
+        &dev_ctx, AV_HWDEVICE_TYPE_VULKAN, "0", nullptr, 0
+    );
+    av_buffer_unref(&dev_ctx);
+
+    cached.store(ret, std::memory_order_release);
+    LOGI("probeVulkan: ret=%d (%s)", ret, ret == 0 ? "available" : "unavailable");
+    return ret;
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +851,9 @@ Java_com_video2x_android_Video2XNative_getProcessedFrames(JNIEnv* /*env*/, jobje
     if (g_proc) {
         return static_cast<jlong>(g_proc->get_processed_frames());
     }
+    if (const int a4k_frames = a4k_processed_frames(); a4k_frames > 0) {
+        return static_cast<jlong>(a4k_frames);
+    }
     return static_cast<jlong>(g_rotate_frames.load());
 }
 
@@ -823,6 +862,9 @@ Java_com_video2x_android_Video2XNative_getTotalFrames(JNIEnv* /*env*/, jobject /
     std::lock_guard<std::mutex> lk(g_mutex);
     if (g_proc) {
         return static_cast<jlong>(g_proc->get_total_frames());
+    }
+    if (const int a4k_total = a4k_total_frames(); a4k_total > 0) {
+        return static_cast<jlong>(a4k_total);
     }
     return static_cast<jlong>(g_rotate_total.load());
 }
@@ -844,7 +886,8 @@ Java_com_video2x_android_Video2XNative_abort(JNIEnv* /*env*/, jobject /*thiz*/) 
         LOGI("abort requested (supersample)");
     }
     g_rotate_abort.store(true);
-    LOGI("abort requested (rotate)");
+    a4k_request_abort();
+    LOGI("abort requested (rotate/anime4k)");
 }
 
 }  // extern "C"

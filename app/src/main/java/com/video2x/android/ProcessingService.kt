@@ -182,7 +182,7 @@ class ProcessingService : Service() {
             val effectiveBitRate = when {
                 req.isImage -> 0L
                 req.bitRate > 0 -> req.bitRate
-                req.codec.contains("mediacodec") -> defaultBitRateFor(outW, outH)
+                req.codec.contains("mediacodec") -> defaultBitRateFor(outW, outH, videoInfo?.fps ?: 0.0)
                 else -> 0L
             }
 
@@ -224,20 +224,45 @@ class ProcessingService : Service() {
                         req.bitRate,
                     )
                 } else {
-                    Video2XNative.process(
-                        inFile.absolutePath,
-                        outFile.absolutePath,
-                        req.algo.id,
-                        req.model,
-                        req.scale,
-                        req.noiseLevel,
-                        nativeW,
-                        nativeH,
-                        req.frameMultiplier,
-                        req.shader,
-                        req.codec,
-                        effectiveBitRate,
-                    )
+                    // Anime4K 在缺少 Vulkan 1.2 特性的设备（如骁龙 865 的
+                    // Adreno 650 驱动）上无法走 ffmpeg 的 libplacebo 滤镜，
+                    // 改由内置的 Vulkan 1.1 渲染器直接执行同一份 shader。
+                    val useDirectRenderer =
+                        req.algo == Algo.ANIME4K && Video2XNative.probeVulkan() != 0
+                    if (useDirectRenderer) {
+                        val shaderFile =
+                            File(ctx.filesDir, "models/libplacebo/${req.shader}.glsl")
+                        appendLog(
+                            req.logPath,
+                            "[app] anime4k: libplacebo 不可用（缺 Vulkan 1.2），" +
+                                "改用内置 Vulkan 1.1 渲染器: ${shaderFile.absolutePath}",
+                        )
+                        Video2XNative.processAnime4K(
+                            inFile.absolutePath,
+                            outFile.absolutePath,
+                            shaderFile.absolutePath,
+                            nativeW,
+                            nativeH,
+                            req.codec,
+                            effectiveBitRate,
+                            req.isImage,
+                        )
+                    } else {
+                        Video2XNative.process(
+                            inFile.absolutePath,
+                            outFile.absolutePath,
+                            req.algo.id,
+                            req.model,
+                            req.scale,
+                            req.noiseLevel,
+                            nativeW,
+                            nativeH,
+                            req.frameMultiplier,
+                            req.shader,
+                            req.codec,
+                            effectiveBitRate,
+                        )
+                    }
                 }
             }
 
@@ -406,7 +431,13 @@ class ProcessingService : Service() {
     // ------------------------------------------------------------ 辅助
 
     /** 输入视频探测结果 */
-    private data class VideoInfo(val width: Int, val height: Int, val bitRate: Long)
+    private data class VideoInfo(
+        val width: Int,
+        val height: Int,
+        val bitRate: Long,
+        /** 帧率；探测不到时为 0（下游按 30fps 兜底） */
+        val fps: Double = 0.0,
+    )
 
     /**
      * 读取输入视频的宽高与码率，任一失败取 0。
@@ -439,6 +470,7 @@ class ProcessingService : Service() {
         var w = 0
         var h = 0
         var br = 0L
+        var fps = 0.0
 
         try {
             val ex = MediaExtractor()
@@ -452,6 +484,18 @@ class ProcessingService : Service() {
                 if (f.containsKey(MediaFormat.KEY_BIT_RATE)) {
                     br = f.getInteger(MediaFormat.KEY_BIT_RATE).toLong()
                 }
+                if (f.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+                    // 不同容器/编码器写入的类型不一致：MP4 多为 Integer，部分为 Float
+                    fps = try {
+                        f.getInteger(MediaFormat.KEY_FRAME_RATE).toDouble()
+                    } catch (_: Throwable) {
+                        try {
+                            f.getFloat(MediaFormat.KEY_FRAME_RATE).toDouble()
+                        } catch (_: Throwable) {
+                            0.0
+                        }
+                    }
+                }
                 break
             }
             ex.release()
@@ -459,7 +503,7 @@ class ProcessingService : Service() {
             // 忽略，交给下面的回退
         }
 
-        if (w <= 0 || h <= 0 || br <= 0) {
+        if (w <= 0 || h <= 0 || br <= 0 || fps <= 0.0) {
             try {
                 val mmr = MediaMetadataRetriever()
                 mmr.setDataSource(file.absolutePath)
@@ -475,13 +519,17 @@ class ProcessingService : Service() {
                     br = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)
                         ?.toLongOrNull() ?: 0L
                 }
+                if (fps <= 0.0) {
+                    fps = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
+                        ?.toDoubleOrNull() ?: 0.0
+                }
                 mmr.release()
             } catch (_: Exception) {
                 // 保持 0
             }
         }
 
-        return VideoInfo(w, h, br)
+        return VideoInfo(w, h, br, fps)
     }
 
     /**
@@ -490,22 +538,17 @@ class ProcessingService : Service() {
      * 被放大成夸张码率（这正是此前「输入 × 像素比」算法体积失控的根源）。
      * Android MediaCodec 默认即 VBR 模式，简单帧会自动降码率，进一步缩小体积。
      */
-    private fun defaultBitRateFor(outW: Int, outH: Int): Long {
-        val longSide = maxOf(outW, outH).toLong()
-        if (longSide <= 0) return 6_000_000L
-        // 基于输出长边的经验质量目标（H.264 / H.265）：
-        //   720p ≈ 3 Mbps，1080p ≈ 6 Mbps，1440p ≈ 10 Mbps，2160p(4K) ≈ 18 Mbps
-        return when {
-            longSide <= 720  -> 3_000_000L
-            longSide <= 1080 -> 6_000_000L
-            longSide <= 1440 -> 10_000_000L
-            longSide <= 2160 -> 18_000_000L
-            // 长边超过 4K：按与 4K 的线性比例外推（而非面积平方，否则 8K 会爆到 200Mbps+），
-            // 并封顶 80Mbps，兼顾画质与体积。
-            else -> (18_000_000.0 + (longSide - 2160) / 1080.0 * 18_000_000.0)
-                .toLong()
-                .coerceAtMost(80_000_000L)
-        }
+    private fun defaultBitRateFor(outW: Int, outH: Int, fps: Double): Long {
+        val px = outW.toLong() * outH
+        if (px <= 0) return 6_000_000L
+
+        val f = if (fps in 1.0..240.0) fps else 30.0
+
+        // 约 0.05 bit/像素/帧：
+        //   1080p@30 ≈ 3.1 Mbps，1800x3840@30 ≈ 10.4 Mbps，@60 ≈ 20.7 Mbps
+        // 与 libx264 CRF 23 在同类素材上的实测码率（6~10 Mbps）对齐，
+        // 避免此前「按长边线性外推」在 1800x3840 上算出 46 Mbps 的问题。
+        return (px * f * 0.05).toLong().coerceIn(2_000_000L, 40_000_000L)
     }
 
     /** 固定用 US locale 格式化，避免某些系统用逗号作小数分隔符 */

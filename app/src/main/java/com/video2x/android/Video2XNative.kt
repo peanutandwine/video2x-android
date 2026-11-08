@@ -41,6 +41,38 @@ object Video2XNative {
     external fun setResourceDir(dir: String)
 
     /**
+     * 探测本机 Vulkan 是否满足 Anime4K（libplacebo）的要求。
+     *
+     * ffmpeg 7.x 的 Vulkan 硬件上下文把 timeline semaphore 当作硬性要求，
+     * 部分老设备（如骁龙865 的早期 Adreno 驱动）没有该扩展，libplacebo
+     * 滤镜必然初始化失败。结果在 native 侧按进程缓存。
+     *
+     * @return 0 表示可用；负数表示不可用（FFmpeg AVERROR）
+     */
+    external fun probeVulkan(): Int
+
+    /**
+     * Anime4K 直连管线（Vulkan 1.1，不经过 ffmpeg 的 libplacebo 滤镜）。
+     *
+     * 用于 Vulkan 1.2 特性缺失的设备（如骁龙 865 的 Adreno 650 驱动）：
+     * libplacebo 硬性要求 timelineSemaphore / hostQueryReset，这类机型上必然
+     * 初始化失败，所以改由 App 自己执行 Anime4K 的 shader 链。
+     *
+     * @param shaderPath 已解压的 .glsl 绝对路径
+     * @return 0 成功；-2 用户中止；负数失败
+     */
+    external fun processAnime4K(
+        inPath: String,
+        outPath: String,
+        shaderPath: String,
+        outW: Int,
+        outH: Int,
+        codec: String,
+        bitRate: Long,
+        isImage: Boolean,
+    ): Int
+
+    /**
      * 执行处理。阻塞调用，必须放在工作线程。
      *
      * @return 0 成功；负数错误码（FFmpeg AVERROR 或 -1 表示参数/异常错误）

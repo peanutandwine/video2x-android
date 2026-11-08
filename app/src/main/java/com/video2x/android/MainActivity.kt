@@ -112,6 +112,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     // 默认着色器为 anime4k-v4-a（快速档）。
     var algo by mutableStateOf(Algo.ANIME4K)
 
+    /**
+     * 本机是否能走 ffmpeg 的 libplacebo 滤镜（即具备 Vulkan 1.2 的
+     * timelineSemaphore / hostQueryReset）。
+     *
+     * 不能走的设备（如骁龙 865 的 Adreno 650 驱动）会自动切到内置的
+     * Vulkan 1.1 渲染器执行同一份 Anime4K shader —— 功能不变，只是换了执行层。
+     */
+    var anime4kLibplacebo by mutableStateOf(true)
+        private set
+
     /** 旋转 / 翻转位掩码（视频旋转功能用）：1=顺时针90° 2=逆时针90° 4=水平翻转 8=垂直翻转 */
     var rotateTransform by mutableStateOf(0)
 
@@ -209,6 +219,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             if (msg != null) prepareMessage = msg
+
+            // 探测 ffmpeg 的 Vulkan 硬件上下文能否创建。失败仅表示要走内置
+            // 渲染器（Vulkan 1.1 直连），Anime4K 仍然可用。
+            anime4kLibplacebo = withContext(Dispatchers.IO) {
+                runCatching { Video2XNative.probeVulkan() }.getOrDefault(-1) == 0
+            }
+
             ready = true
         }
     }
@@ -578,12 +595,24 @@ private fun MainScreen(vm: MainViewModel = viewModel()) {
                 Algo.entries.toList()
             },
             selected = vm.algo,
-            optionLabel = { it.label },
+            optionLabel = { a ->
+                if (a == Algo.ANIME4K && !vm.anime4kLibplacebo) "${a.label}（兼容模式）"
+                else a.label
+            },
             onSelect = { vm.algo = it },
         )
 
         when (vm.algo) {
             Algo.ANIME4K -> {
+                if (!vm.anime4kLibplacebo) {
+                    Text(
+                        "本机 GPU 驱动只支持 Vulkan 1.1，libplacebo 无法初始化。" +
+                            "已自动改用内置 Vulkan 1.1 渲染器执行同一份 Anime4K 着色器，" +
+                            "画质一致，速度可能略慢。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.tertiary,
+                    )
+                }
                 EnumDropdown(
                     label = "着色器",
                     options = Catalogs.anime4kShaders,
